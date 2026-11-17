@@ -1,0 +1,31 @@
+menu "GA100VFI glitcher"
+
+	choice GA_I2C_DEFAULT_BAUD
+		prompt "Default I2C bus speed (runtime switchable with @F)"
+		default GA_I2C_BAUD_400K
+		help
+		  The card's SMBus pull-ups are specified for 400 kHz (Fm); Fm+ rise
+		  times are not guaranteed, so 1 MHz is an experimental setting only.
+
+		config GA_I2C_BAUD_100K
+			bool "100 kHz"
+		config GA_I2C_BAUD_400K
+			bool "400 kHz (Fm, recommended)"
+		config GA_I2C_BAUD_1M
+			bool "1 MHz (Fm+, experimental)"
+	endchoice
+
+	config GA_I2C_BAUD_HZ
+		int
+		default 100000 if GA_I2C_BAUD_100K
+		default 400000 if GA_I2C_BAUD_400K
+		default 1000000 if GA_I2C_BAUD_1M
+
+	config GA_ALLOW_OCTAL_PINS
+		bool "Allow I2C/RST pins in the 33-37 range"
+		default n
+		help
+		  GPIO33-37 are usable unless the module has octal SPI flash/PSRAM
+		  (e.g. N8R8). Only enable this after checking your module.
+
+endmenu

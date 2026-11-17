@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GA100VFI</title>
+<style>
+:root{color-scheme:dark}body{background:#111;color:#ddd;font:14px/1.5 monospace;max-width:1000px;margin:20px auto;padding:0 12px}h1{font-size:20px;color:#8ce}h2{font-size:15px;color:#adb;margin:0 0 10px}section{border:1px solid #38434b;border-radius:7px;padding:14px;margin:12px 0}label{display:flex;flex-direction:column;gap:4px}input,select,button{font:inherit;background:#19232c;color:#eee;border:1px solid #526477;border-radius:4px;padding:6px;min-width:0}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}button:hover:enabled{background:#2d4356}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.row{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:12px}.row input{flex:1}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.hint{color:#aab8c7;font-size:12px}.notice{color:#9de;white-space:pre-wrap}.error{color:#ffb4a8}#log{height:240px;overflow:auto;background:#080b0e;padding:10px;margin-bottom:10px;border:1px solid #34424e;font-size:12px}#manual[hidden]{display:none}#status{min-height:65px}
+</style>
+</head>
+<body>
+<h1>GA100VFI</h1>
+<section><h2>设备状态</h2><pre id="status">正在连接…</pre><div id="connection" class="hint"></div></section>
+<section>
+<h2>自动尝试</h2>
+<form id="campaign-form">
+<div class="grid">
+<label>判决来源<select name="mode"><option value="1">主机 agent / 手动</option><option value="0">SMBPBI（需启用）</option></select></label>
+<label>下探电压 mV<input name="vd" type="number" value="354" min="0" max="1000" required></label>
+<label>下探时间 µs<input name="td" type="number" value="-60" min="-1000000" max="1000000" required></label>
+<label>恢复电压 mV<input name="vr" type="number" value="750" min="0" max="1000" required></label>
+<label>恢复时间 µs<input name="tr" type="number" value="-20" min="-1000000" max="1000000" required></label>
+<label>脉冲数<input name="pulses" type="number" value="3" min="1" max="16" required></label>
+<label>脉宽 µs（0 自动）<input name="pw" type="number" value="198" min="0" max="1000000" required></label>
+<label>间隔 µs（0 自动）<input name="gap" type="number" value="150" min="0" max="1000000" required></label>
+<label>延迟 µs（最多6点）<input name="delays" value="117" maxlength="90" required></label>
+<label>总次数（0 不限）<input name="max" type="number" value="200" min="0" required></label>
+<label>每批次数（0 固定电压）<input name="batch" type="number" value="5" min="0" required></label>
+<label>最低电压 mV<input name="minv" type="number" value="300" min="0" max="1000" required></label>
+<label>最高电压 mV<input name="maxv" type="number" value="380" min="0" max="1000" required></label>
+<label>调整步长 mV<input name="step" type="number" value="6" min="1" max="1000" required></label>
+<label>判决前等待 ms<input name="wait" type="number" value="300" min="250" max="60000" required></label>
+</div>
+<div class="row"><button id="start" type="submit">开始</button><button id="stop" type="button">停止并恢复</button><span id="campaign-message" class="notice" role="status"></span></div>
+</form>
+<pre id="campaign-status" class="hint"></pre>
+<div id="manual" class="row" hidden>
+<span>当前轮判决：</span>
+<button data-verdict="goldilocks">GOLDILOCKS</button><button data-verdict="hit">hit</button><button data-verdict="under">under</button><button data-verdict="over">over</button><button data-verdict="lost">lost</button>
+</div>
+<p class="hint">主机 agent / 手动模式只在当前尝试完成后接收结果。主机上运行 ga100vfi_agent.py，并通过 --bdf 指定显卡。</p>
+</section>
+<section><h2>控制台</h2><pre id="log"></pre><form id="command-form" class="row"><input id="command" maxlength="255" placeholder="v / @C status / g …" aria-label="串口命令" required><button>发送</button></form><div id="command-message" class="notice" role="status"></div></section>
+<section><h2>固件升级</h2><form id="ota-form" class="row"><input type="file" id="firmware" accept=".bin" required aria-label="固件文件"><button id="flash">上传并重启</button></form><div id="ota-message" class="notice" role="status"></div></section>
+<section><h2>Wi-Fi</h2><form id="wifi-form"><div class="grid"><label>SSID<input id="ssid" autocomplete="off"></label><label>密码<input id="password" type="password" autocomplete="new-password"></label></div><div class="row"><button>保存并连接</button><span class="hint">SSID 和密码都留空可清除；AP 仍可访问。</span></div></form><div id="wifi-message" class="notice" role="status"></div></section>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let state = null, position = 0, boot = null, uptime = 0, generation = 0;
+function message(id, text, error=false) {
+  $(id).textContent = text;
+  $(id).classList.toggle('error', error);
+}
+async function api(path, options={}) {
+  const response = await fetch(path, {...options, cache:'no-store'});
+  const text = await response.text();
+  if (!response.ok) throw new Error(text || `HTTP ${response.status}`);
+  return text;
+}
+function token(c) {
+  return c && c.running && c.mode === 1 && c.awaiting_verdict && c.session > 0 && c.attempt > 0
+    ? {session:c.session, attempt:c.attempt} : null;
+}
+async function poll() {
+  try {
+    const s = JSON.parse(await api('/api/status'));
+    const b = s.board, c = s.campaign, n = s.net;
+    if (boot !== null && (boot !== b.boot || b.uptime_s < uptime)) {
+      position = 0; generation++; $('log').textContent = '[设备已重启]\n';
+    }
+    boot = b.boot; uptime = b.uptime_s; state = s;
+    let text = `运行 ${b.uptime_s}s  启动 #${b.boot}  总线 ${b.baud}Hz  阶段 ${b.phase}\n复位原因：${b.reset}\n网络：${n.sta ? n.ip + '  RSSI ' + n.rssi : 'AP ' + n.ap}`;
+    if (b.last) text += `\n上次尝试 #${b.last.seq}  vd=${b.last.vd}mV  写失败=${b.last.wfail}  UV=${b.last.vout_uv}  slip=${b.last.slip_us ?? '-'}µs  reset slip=${b.last.reset_slip_us ?? '-'}µs`;
+    $('status').textContent = text;
+    $('campaign-status').textContent = `阶段 ${c.phase}  session ${c.session} / attempt ${c.attempt}  延迟 ${c.delay}µs  电压 ${c.v_dip}mV\n次数 ${c.tries}  有效 ${c.valid}  under ${c.under}  over ${c.over}  hit ${c.hit}  lost ${c.lost}  nack ${c.nack}  timeout ${c.timeouts ?? 0}`;
+    $('start').disabled = c.running;
+    $('stop').disabled = !c.running;
+    $('flash').disabled = c.running;
+    $('manual').hidden = !token(c);
+    if (c.goldilocks) message('campaign-message', `GOLDILOCKS：delay=${c.best_delay}µs，vd=${c.best_v_dip}mV`);
+    message('connection', '');
+  } catch (error) {
+    state = null; $('manual').hidden = true;
+    message('connection', '连接失败：' + error.message, true);
+  } finally { setTimeout(poll, 1000); }
+}
+async function logs() {
+  const gen = generation;
+  try {
+    for (let i=0; i<5; i++) {
+      const response = await fetch('/api/log?pos=' + position, {cache:'no-store'});
+      if (!response.ok) throw new Error('log HTTP ' + response.status);
+      const next = Number(response.headers.get('X-Log-Pos'));
+      const text = await response.text();
+      if (gen !== generation) break;
+      if (Number.isFinite(next) && next >= 0) position = next;
+      if (text) {
+        const log = $('log'), stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+        log.appendChild(document.createTextNode(text));
+        if (log.textContent.length > 40000) log.textContent = log.textContent.slice(-30000);
+        if (stick) log.scrollTop = log.scrollHeight;
+      }
+      if (!text || new TextEncoder().encode(text).length < 2048) break;
+    }
+  } catch (_) {} finally { setTimeout(logs, 1200); }
+}
+$('campaign-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const q = new URLSearchParams(new FormData(event.target)); q.set('op','start');
+  try { message('campaign-message', await api('/api/campaign?' + q)); }
+  catch (error) { message('campaign-message', error.message, true); }
+});
+$('stop').addEventListener('click', async () => {
+  try { message('campaign-message', await api('/api/campaign?op=stop')); }
+  catch (error) { message('campaign-message', error.message, true); }
+});
+document.querySelectorAll('[data-verdict]').forEach(button => button.addEventListener('click', async () => {
+  const t = state && token(state.campaign);
+  if (!t) return message('campaign-message', '当前没有等待判决的尝试。', true);
+  const q = new URLSearchParams({...t, r:button.dataset.verdict});
+  try {
+    await api('/api/verdict?' + q);
+    $('manual').hidden = true;
+    message('campaign-message', `已接收第 ${t.attempt} 轮判决：${button.dataset.verdict}`);
+  } catch (error) { message('campaign-message', error.message, true); }
+}));
+$('command-form').addEventListener('submit', async event => {
+  event.preventDefault(); const value = $('command').value;
+  try {
+    message('command-message', await api('/api/cmd', {method:'POST', body:value}));
+    $('command').value = '';
+  } catch (error) { message('command-message', error.message, true); }
+});
+$('wifi-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const q = new URLSearchParams({ssid:$('ssid').value, pass:$('password').value});
+  try { message('wifi-message', await api('/api/wifi?' + q)); }
+  catch (error) { message('wifi-message', error.message, true); }
+});
+$('ota-form').addEventListener('submit', async event => {
+  event.preventDefault(); const file = $('firmware').files[0]; if (!file) return;
+  $('flash').disabled = true; message('ota-message', `上传中：${file.size} 字节…`);
+  try { message('ota-message', await api('/api/ota', {method:'POST', body:file})); }
+  catch (error) { message('ota-message', error.message, true); }
+  finally { $('flash').disabled = !!(state && state.campaign.running); }
+});
+poll(); logs();
+</script>
+</body>
+</html>
