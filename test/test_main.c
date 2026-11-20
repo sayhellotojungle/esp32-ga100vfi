@@ -44,9 +44,42 @@ void pmbus_scl_hold(bool low){bus_held=low;}
 uint32_t pmbus_baud_hz(void){return actual_baud;}
 uint32_t pmbus_requested_baud_hz(void){return requested_baud;}
 uint32_t pmbus_write_us(void){return glitch_pmbus_w_us(actual_baud);}
-bool pmbus_w(uint8_t reg,const uint8_t*d,int n){(void)d;(void)n;write_calls++;clock_us+=100;return !bus_held && reg!=fail_reg;}
+// The controller models its own write protect: while it is armed, every register
+// the restore path needs nacks, and only the password clears it. Without this the
+// firmware could pass a suite that never exercises the case where the VRM re-armed its
+// protect between the last pulse and the hand-back.
+//
+// vrm_fault is the half that used to be missing, and the half that cost a day: a latched
+// fault (exactly what our own over/under-voltage pulse produces) makes the part answer
+// reads and *refuse the password*. Only CLEAR_FAULTS lets it in, and 0x03 is a plain
+// command, not a protected write, so the write protect does not gate it. With the old
+// password-first order this state is unreachable-from-itself: 20 no-op shots, and the
+// bench concluded "the VRM latches solid, pull VDD33" -- which was wrong.
+static int vrm_locked,vrm_fault;
+/* Register file: the firmware writes config-id 0x46=0x1229 and reads it back, so a
+ * fixture that answers every read with zero reports UNLOCK_CONFIGID on every shot.
+ * Writes land here only when the controller accepts them, which is what makes the
+ * read-back assertion mean something. */
+static uint8_t regs[256];
+/* devinit re-arm: the part ACKs the config-id write and keeps 0x1228 anyway. Only the
+ * read-back catches this, which is why the firmware compares bytes instead of trusting ACK. */
+static int cfg_devinit_locked;
+static bool protected_reg(uint8_t r){return r==0x13||r==0x1F||r==0x21||r==0xE1||r==0x46;}
+bool pmbus_w(uint8_t reg,const uint8_t*d,int n){
+    write_calls++;clock_us+=100;
+    if(bus_held||reg==fail_reg) return false;
+    if(reg==0x03){vrm_fault=0;return true;}                  // plain command, never gated
+    if(vrm_locked&&protected_reg(reg)) return false;
+    if(reg==0xF2){if(vrm_fault)return false;vrm_locked=0;}   // the password took
+    if(cfg_devinit_locked&&reg==0x46) return true;           // ACKed, and not stored
+    if(n>=1)regs[reg]=d[0];
+    if(n>=2)regs[(uint8_t)(reg+1)]=d[1];
+    return true;}
 bool pmbus_w16(uint8_t r,uint16_t v){uint8_t d[2]={(uint8_t)v,(uint8_t)(v>>8)};return pmbus_w(r,d,2);}
-bool pmbus_r(uint8_t reg,uint8_t*d,int n){memset(d,0,(size_t)n);clock_us+=100;if(reg==0x7e)d[0]=8;return !bus_held && reg!=fail_read_reg;}
+bool pmbus_r(uint8_t reg,uint8_t*d,int n){memset(d,0,(size_t)n);clock_us+=100;
+    if(reg==0x7e)d[0]=(vrm_locked?0:8)|(vrm_fault?0x20:0);
+    if(reg==0x46&&n>=2){d[0]=cfg_devinit_locked?0x28:regs[0x46];d[1]=cfg_devinit_locked?0x12:regs[0x47];}
+    return !bus_held && reg!=fail_read_reg;}
 bool pmbus_raw_write(uint8_t a,const uint8_t*b,int n){(void)a;(void)b;(void)n;return false;}
 bool pmbus_raw_read(uint8_t a,uint8_t*b,int n){(void)a;(void)b;(void)n;return false;}
 void pmbus_cmd(char*s){snprintf(last_bus_command,sizeof last_bus_command,"%s",s);}
@@ -69,6 +102,11 @@ int main(void)
     a.vd=325;
     int failed=-1;uint32_t seq=0;
     CHECK(board_execute_glitch(&a,&failed,&seq));CHECK(failed==0 && seq!=0 && s_last.valid);
+    // The config-id is part of unlocking, not a follow-up nicety: without 0x46=0x1229 the
+    // GPU's devinit re-locks the VRM after the first pulse releases PEX_RST, and every later
+    // shot dies at the unlock gate. Assert the part actually holds the value (bus ACK alone
+    // never proves a write landed), and that the firmware checks the read-back.
+    CHECK(regs[0x46]==0x29&&regs[0x47]==0x12);
     CHECK(!reset_low && !board_is_busy());
     fail_reg=0x21;CHECK(board_execute_glitch(&a,&failed,&seq));CHECK(failed>0);
     CHECK(!reset_low && !bus_held && !board_is_busy());fail_reg=-1;
@@ -76,6 +114,35 @@ int main(void)
     char js[768];board_status_json(js,sizeof js);CHECK(strstr(js,"\"diag_ok\":false")!=NULL);
     CHECK(strstr(js,"\"reset_timing\":\"software\"")!=NULL);
     struct {char out[4];char guard;} tiny={{0},'X'};board_status_json(tiny.out,sizeof tiny.out);CHECK(tiny.guard=='X');
+    // A fault latch is the state our own pulse leaves behind, and it is not the same thing
+    // as a dead part: it answers reads and refuses the password *only while the fault
+    // stands*. GA_CLR lives in the timeline and the timeline is gated behind the password,
+    // so asking the password first can never get out -- which is exactly how twenty
+    // attempts went out as no-ops while PEX_RST never moved. CLEAR_FAULTS before the
+    // password is the whole fix, and this is the test that keeps it fixed.
+    vrm_locked=1;vrm_fault=1;fail_reg=-1;failed=-1;
+    CHECK(board_execute_glitch(&a,&failed,&seq));CHECK(failed==0 && !reset_low);
+    CHECK(!vrm_locked && !vrm_fault);
+    vrm_locked=1;vrm_fault=0;failed=0;
+    CHECK(board_execute_glitch(&a,&failed,&seq));CHECK(failed==0);   // plain protect, no fault
+    // A part that really does refuse the password (not a fault) must not silently look like
+    // a fired shot: no reset pulse, and a reported failure the host can act on.
+    vrm_locked=1;fail_reg=0xF2;failed=0;
+    CHECK(!board_execute_glitch(&a,&failed,&seq));CHECK(!reset_low);
+    fail_reg=-1;vrm_locked=0;failed=0;
+    CHECK(board_execute_glitch(&a,&failed,&seq));CHECK(failed==0);   // and it recovers on its own
+    // config-id refused outright (write NACK) and config-id ACKed-but-not-stored (devinit
+    // re-arm) are the two ways the unlock can be incomplete. Both must stop the shot before
+    // PEX_RST moves: firing without 0x1229 is what produced a round of twelve where only the
+    // first attempt was real, and the verdict cannot tell that apart.
+    vrm_locked=1;fail_reg=0x46;failed=0;
+    CHECK(!board_execute_glitch(&a,&failed,&seq));CHECK(!reset_low);
+    fail_reg=-1;vrm_locked=0;failed=0;
+    cfg_devinit_locked=1;
+    CHECK(!board_execute_glitch(&a,&failed,&seq));CHECK(!reset_low);
+    cfg_devinit_locked=0;failed=0;
+    CHECK(board_execute_glitch(&a,&failed,&seq));CHECK(failed==0);   // recover
+    CHECK(regs[0x46]==0x29&&regs[0x47]==0x12);
     s_fx.cookie=FX_COOKIE;s_fx.cookie_inv=~FX_COOKIE;s_fx.phase=PH_GLITCH_RUN;
     s_fx.magic=FX_MAGIC_WDT;s_fx.boot_count=7;reset_reason=ESP_RST_SW;
     reset_history_init();CHECK(strstr(reset_note,"WATCHDOG") && strstr(reset_note,"phase=3"));

@@ -1,6 +1,6 @@
 # 构建与运行
 
-本版交付源码和离线回归测试。交付环境没有 ESP-IDF / Arduino ESP32 交叉编译工具链，因此下面是可复现的构建入口，**不是“本版已在 ESP32 上编译、刷写通过”的记录**。实际检查结果见 [TEST_RESULTS.md](TEST_RESULTS.md)。
+本文给出可复现的构建入口。`firmware/` 附带 arduino-cli（Arduino-ESP32 3.3.11，`FlashSize=16M,PSRAM=opi`）交叉编译的 0.3.0 镜像；构建与验证范围见 [TEST_RESULTS.md](TEST_RESULTS.md)。
 
 所有命令默认在项目根目录执行。
 
@@ -20,10 +20,22 @@
 ## 2. 先运行离线测试
 
 ```sh
-python test/run_tests.py
+python test/run_tests.py            # 需要本机有 C 编译器
+python test/run_tests.py --sanitizers
 ```
 
 该入口编译并运行本机 C 测试，同时运行 Python 单元测试。C 测试用的是项目内的 RTOS/外设替身，不能证明真实驱动、Wi-Fi 或电气时序正确。测试环境与具体结果统一记录在 [TEST_RESULTS.md](TEST_RESULTS.md)。
+
+没有 C 编译器的工作站（例如只装 Python 的 Windows）用同一条命令把测试输入打包送到有 gcc 的 Linux 机器（判决机）上跑，判据不变：
+
+```bat
+set BENCH_HOST=<判决机IP>
+set BENCH_USER=<判决机用户>
+set BENCH_PW=<判决机口令>
+python tools/pack_src_tests.py --run
+```
+
+退出码即测试套件的退出码，可用于卡住发布。成功输出为 `OFFLINE REGRESSIONS PASSED`；`--sanitizers` 启用 ASan/UBSan（`ASAN_OPTIONS=detect_leaks=0`，替身故意保留伪 RTOS 句柄）。`python test/run_tests.py --python-only` 只跑主机端测试。
 
 更新网页或固件源文件后执行：
 
@@ -50,10 +62,10 @@ idf.py -B build-idf build
 明确选择正确串口后，才运行刷写命令，例如：
 
 ```sh
-idf.py -B build-idf -p COM5 flash monitor
+idf.py -B build-idf -p <串口> flash monitor
 ```
 
-Linux 将 `COM5` 替换成实际设备路径。UART0 控制台为 115200、8N1。无自动复位线路的 TTL 适配器，需要按板卡自身的下载模式操作说明手动进入 bootloader。
+串口参数按实际设备填写（Windows 形如 `COM7`，Linux 通常是 `/dev/ttyUSB0` 或 `/dev/ttyACM0`）。UART0 控制台为 115200、8N1。无自动复位线路的 TTL 适配器，需要按板卡自身的下载模式操作说明手动进入 bootloader。
 
 ## 4. Arduino 构建
 
@@ -75,12 +87,29 @@ arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" --build
 上传必须使用与该次构建一致的板卡选项和正确串口：
 
 ```sh
-arduino-cli upload -p COM5 --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" --input-dir build-arduino arduino/ga100vfi
+arduino-cli upload -p <串口> --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" --input-dir build-arduino arduino/ga100vfi
 ```
 
 上传命令不会自动编译，须确认指定目录来自本次成功构建。若当前 core 的选项名称不同，以 `arduino-cli board details --fqbn esp32:esp32:esp32s3` 输出为准；不得使用旧构建目录中的二进制代替重新构建。
 
 CLI 参数参考：[compile](https://arduino.github.io/arduino-cli/1.4/commands/arduino-cli_compile/)、[upload](https://arduino.github.io/arduino-cli/1.4/commands/arduino-cli_upload/)。
+
+### 4.1 发布打包与门禁
+
+依次通过才算一版：
+
+```sh
+python tools/sync_arduino.py
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" --build-path build-arduino arduino/ga100vfi
+python tools/package_firmware.py --prune     # 按 main/board.h 的版本打包 firmware/，写 firmware/RELEASE.json
+python tools/package_firmware.py --check     # 发布的镜像必须来自当前固件源码
+python tools/pack_src_tests.py --run         # 判决机上 OFFLINE REGRESSIONS PASSED
+python tools/deploy_bench.py                 # 三处版本号一致 + 脚本语法 + 红线防护在位
+python tools/gen_manifest.py                 # 重新生成 MANIFEST.sha256
+python tools/gen_manifest.py --check
+```
+
+`tools/package_firmware.py` 会拒绝两种情况：app 镜像里印出的构建串与 `main/board.h` 的版本号不符（说明编译的是旧目录），以及 `firmware/` 里的镜像与当前固件源码摘要不符（说明改了源码没重编）。`firmware/RELEASE.json` 保存版本、构建串、每个镜像的 sha256、源码摘要与构建时的 git 状态；`git.dirty` 为真表示打包时工作树相对记录的提交有改动，该镜像不应视为那次提交的可复现产物。
 
 ## 5. Python 主机包
 

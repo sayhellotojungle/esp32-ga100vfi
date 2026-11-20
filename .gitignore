@@ -11,5 +11,7 @@ arduino/ga100vfi/*.c
 arduino/ga100vfi/*.h
 !arduino/ga100vfi/*.ino
 
-# 本地开发笔记，不随仓库发布
-CMP170HX解锁经验与踩坑总结.md
+build-arduino/
+
+.pytest_cache/
+

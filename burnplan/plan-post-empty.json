@@ -1,0 +1,48 @@
+{
+  "analysis": {
+    "fb_gib": 80,
+    "nvlink_ok": true,
+    "pcie_gen4_ok": true,
+    "sm_count": 124,
+    "sm_per_gpc": [
+      16,
+      16,
+      14,
+      16,
+      14,
+      16,
+      16,
+      16
+    ],
+    "usable_fbp": 10
+  },
+  "burn": [],
+  "fingerprint": "fc497d01b8255867",
+  "sku": "8gb",
+  "source": "ffprobe.ko@0xf6000000",
+  "targets": {
+    "disable_gen3_speed_bit1": "0x0",
+    "disable_gen3_speed_bit9": "0x0",
+    "fbio_disable": "0xc03000",
+    "fbp_disable": "0x840",
+    "fbpa_disable": "0xc03000",
+    "gpc_disable": "0x0",
+    "nvlink_disable": "0x0",
+    "pcie_boot_gen23_dis": "0x0",
+    "pcie_boot_gen3_dis": "0x0",
+    "pcie_magic_gen4_dis": "0x0",
+    "pes_disable": "0x0",
+    "rop_l2_disable": "0xc03000",
+    "sys_pipe_disable": "0x0",
+    "tpc_gpc0_disable": "0x0",
+    "tpc_gpc1_disable": "0x0",
+    "tpc_gpc2_disable": "0x2",
+    "tpc_gpc3_disable": "0x0",
+    "tpc_gpc4_disable": "0x1",
+    "tpc_gpc5_disable": "0x0",
+    "tpc_gpc6_disable": "0x0",
+    "tpc_gpc7_disable": "0x0"
+  },
+  "uuid": null,
+  "warnings": []
+}

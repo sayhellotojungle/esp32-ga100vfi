@@ -1,301 +1,443 @@
-# esp32-ga100vfi 0.2.0
+# esp32-ga100vfi 0.3.0
 
-用 **ESP32-S3 电压毛刺**解锁 NVIDIA GA100 CMP 170HX（10de:20c2）并**永久烧写 FF 熔丝**的开源方案：
-毛刺进入 Goldilocks 熔丝镜像状态 → 交叉验证烧写计划 → 追加 FF 记录 → 冷启重放，
-把 8 GB 卡解锁为 80 GiB FB / 108 SM / NVLink / PCIe Gen4 潜力（几何显现与 Gen4 重训由驱动层配套完成，见「后续阶段」）。
+ESP32-S3 电压毛刺器，用于 NVIDIA GA100 CMP 170HX（`10de:20c2`）的 FF 熔丝解锁。流程固定为四步：毛刺进入 Goldilocks 状态（`DSOV=0` 且 `CRC_STATUS=0x55`）→ 生成 FF 烧写计划 → 交叉验证 → 追加 FF 记录 → 冷启重放。
 
-本项目复制并改造自 [dalzyu/pico-ga100vfi](https://github.com/dalzyu/pico-ga100vfi)
-（原 RP2350/Pico 实现）：毛刺原理与时序打法承袭上游；固件移植到 ESP32-S3（ESP-IDF / Arduino-ESP32），
-主机端工具、HTTP 协议与熔丝烧写规程在本仓库重写。已在实卡上完整走通并永久化
-（17 条 FF 记录冷启动后逐位回读一致，见「实测记录」）。
+本仓库开发卡实测结果：烧入 16 条记录（行 297–312），冷启后 `80 GiB FB / 124 SM / usable_fbp=10`，重扫剩余计划 0 条。
 
-- 配套工具链（本仓库 `host/` + 同作者独立仓库 **ffcalc**）：快照、计划、仿真、验证
-- 参考：[kate 的毛刺解锁长文](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/)、[cmpunlocker](https://github.com/amoghmunikote/cmpunlocker)（阶段二/三驱动）
+派生自 [dalzyu/pico-ga100vfi](https://github.com/dalzyu/pico-ga100vfi)（RP2350/Pico 实现）：毛刺原理与时序打法承袭上游；固件移植到 ESP32-S3（ESP-IDF / Arduino-ESP32）；主机端工具、HTTP 协议与熔丝烧写规程在本仓库重写。
 
-> 提示：本项目推荐直接把仓库交给 AI 读取并协助部署（构建、烧录、接线核对、跑 campaign 均可），省心省力。
-
-## 原理速览
-
-GA100 在上电/`PEX_RST` 复位释放时对 512 行熔丝阵列做一次采样。用 PMBus 命令把 NVVDD
-在采样窗口内打到恰好"扰动控制熔丝（row 0/1）但不破坏 CRC"的深度，得到 **Goldilocks** 状态：
-
-| 状态 | 判据 | 含义 |
+| 依赖 | 用途 | 是否可替代 |
 |---|---|---|
-| **Goldilocks** | `DSOV=0` `CRC_STATUS=0x55` `SBFE=0` | 熔丝选项字可软件覆盖，可发起 FF 烧写 |
-| under | `DSOV=1` `CRC=0x55` | 没踩到窗口，卡正常启动 |
-| over / lost | `CRC=0x00` 或 BAR0 全 `FF` | 过度毛刺或启动挂死，等下一次 `r` |
+| **ffcalc**（同作者独立仓库） | FF 链分析、烧写计划生成、`verify`/`sim` 交叉验证 | 不可。计划与验证以它为准 |
+| `host/ga100vfi`（本仓库） | 判决链、512 行采集、第二套独立对账、烧写执行 | 不可（本仓库工具与 ffcalc 互为独立实现） |
+| [cmpunlocker](https://github.com/sayhellotojungle/cmpunlocker) | 阶段二/三：驱动层几何显现与 Gen4 重训 | 熔丝之外，与本仓库无关 |
 
-Goldilocks 本身是**易失的**（任何复位/驱动加载即消失）。要永久解锁，必须在该窗口内向
-熔丝阵列的空白行（本卡实测可用行 304–320）**追加 FF 记录**：`record = (data<<16)|(block<<6)|chain`。
-FF 链按行号升序重放、**同一 chain.block 后写覆盖先写**，所以只追加、不擦改，天然安全；
-清位规则（`new & ~old == 0`）+ defective 底线保证只解除 floorsweep、不点亮物理坏块。
+参考：[kate 的毛刺解锁长文](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/)。
 
-### 熔丝宏寄存器与命令（本仓库实机验证）
+---
 
-| 寄存器 | BAR0 偏移 | 说明 |
+## 0. 先读后动
+
+熔丝烧写不可逆。执行任何开火或烧写动作前，先完整读完下表四份文件，并按其判据行动。本项目推荐把仓库整体交给 AI 读取后再由其执行操作；AI 同样适用本节。
+
+| 顺序 | 文件 | 必须从中得到的结论 |
 |---|---|---|
-| FUSECTRL | `0x00820000` | 写低 5 位发命令；FSM 状态在 `bits[20:16]`，IDLE=`0xE0040000` |
-| FUSEADDR | `0x00820004` | 行号 0–511 |
-| FUSEDATA | `0x00820008` | **读口**（CMD_READ 之后有效） |
-| FUSEWDATA | `0x0082000C` | **写口**（PROGRAM 前写记录；写到 `0x820008` 会静默丢失） |
-| FUSEDEBUG | `0x00820060` | 任何非 0 都禁止操作 |
-| CRC_STATUS | `0x00820070` | `0x55` = 镜像有效 |
-| EFP 状态 | `0x00820078` | ENABLE_FUSE_PROGRAM |
-| DSOV 状态 | `0x00820084` | DISABLE_SW_OVERRIDE，Goldilocks 时 =0 |
-| SBFE 状态/shadow | `0x00821108` | secured_burn_feature_enable；DSOV=0 时可写 0 解除烧写锁 |
-| WDATA_WR_SECURE | `0x0082048C` | 写 0 后 FUSE/FUSEOPT PLM 自动全开（不要直接写 `0x8200F4/F8/FC`） |
+| 1 | 本文 §1（使用流程）、§2（判据与寄存器）、§3（安全红线） | 动作顺序、停止条件 |
+| 2 | ffcalc 仓库 `docs/BURNING.md` | 寄存器与命令实机值、烧写七项授权断言、踩坑速查表 |
+| 3 | [docs/UNLOCK_AND_POISON.md](docs/UNLOCK_AND_POISON.md) | VRM 锁态、`FUSECTRL` 四态、恢复顺序、电压窗口实测值 |
+| 4 | [bench/README.md](bench/README.md) | 台架脚本用途与开火前闸门 |
 
-| 命令 | 值 | 实测行为 |
-|---|---:|---|
-| CMD_READ | 1 | 读 FUSEADDR 行到 FUSEDATA，数十 µs 回 IDLE |
-| CMD_PROGRAM | 2 | 经 `0xE00C0000`（WRITE_PROGRAM）回 IDLE；**空白行读回 `0x00000000`（不是 FF）** |
-| SENSE_CTRL | 3 | 重采控制熔丝：EFP/SBFE 回融合值 1，**DSOV 保持 0**（本卡验证） |
+AI 在动手前必须先复述以下五项；任一项说不出即不动手：
 
-FUSECTRL 读到 `0xBADFxxxx` = 命令失败、控制器锁死（不再应答任何读写）：**立即停止一切 BAR0 读**，整机断电再上电。
+1. 目标卡的 `vendor:device`、PCIe BDF、UUID 与 fingerprint；
+2. 当前 `FUSECTRL` 读数及其四态归类；
+3. 计划记录数、行号范围、每条记录的 `chain/block/old/new`；
+4. 分批烧写方案（第一条是哪一行，复核判据是什么）；
+5. 停止条件（§3）与恢复顺序。
 
-## 硬件与接线
+以下三类参数不许自行改动，也不许"顺手优化"：
 
-| 功能 | GPIO |
-|---|---:|
-| I²C SDA（→ VRM 控制器 MP2888B SMBUS） | 6 |
-| I²C SCL | 7 |
-| PEX_RST，开漏输出（只下拉/释放，禁止推挽高） | 10 |
-| UART0 TX / RX（控制台） | 43 / 44 |
+- **波形参数**（`td vr tr pw gap pulses delay`）：只用 §1.3 的档案几何。改动只在 `under`/`over` 判据要求时进行，且必须留下台账证据。
+- **寄存器地址与命令值**：§2 的表全部为实机确认值。
+- **判据**：`FUSECTRL` 四态、poison 后禁止再读 BAR0、`new & ~old == 0`、目标行必须空白。
 
-引脚集中在 [main/board.h](main/board.h)，已内置 strapping/USB/flash/PSRAM 冲突的编译期检查。
-选 6/7 是因为它们靠前且非特殊功能脚——许多 S3 开发板的 GPIO48 被板载 WS2812 灯占用，
-0/3/45/46 是 strapping，19/20 是原生 USB，26–37 被 flash/PSRAM 占用。
+---
 
-ESP32-S3 不挑板子：没有自己的模组就随便买一块 ESP32-S3 开发板，按上表 GPIO 接线、刷入固件即可。
-本仓库开发卡的毛刺板是早前 openUPS 项目遗留的模组，临时征用，并非必需规格。
+## 1. 使用流程
 
-SDA/SCL 接插件务必压实，总线"全死"最常见的原因就是接触不良。
+顺序固定，每一步都有判据；判据不满足就停在该步，不带病进入下一步。
 
-**硬件特别提醒**（改接线、改 GPIO 或让 AI 改固件前先重读一遍）：
+本文档里的地址、口令、串口、BDF 一律是占位符，不给具体值：`<设备IP>` 是毛刺板的 LAN 地址（配网后由串口横幅或 `/api/status` 得到）、`<判决机IP>` 是插卡并跑 Linux 的主机地址、`<串口>` 是 TTL 适配器设备名、`<BDF>` 用 `lspci -D -d 10de:` 现取。台架脚本对这些值也不给默认——没填就退出，免得别人的台架地址变成你的操作目标。
 
-- `PEX_RST` 是 1.8 V 网络，而 ESP32-S3 的 pad 是 3.3 V：这根线**只能拉低或释放（高阻），
-  绝不允许输出高电平**，任何情况下不得改成推挽驱动，否则 3.3 V 直接灌进 1.8 V 复位网络。
-  固件里它终身固定为开漏（`GPIO_MODE_OUTPUT_OD`），改代码必须保持这一不变量。
-- 某些特殊 IO（0/3/45/46 等 strapping 脚）在上电或下载模式下会被内部弱上拉自行拉高，
-  不要接 `PEX_RST`，也不要接 SMBus——`board.h` 的编译期检查会拦住大部分错误选择。
-- GND：建议显卡与毛刺板之间**直接接一根 GND 线**；实在不方便也可经主板/供电共地，
-  只是回路绕远、毛刺期间地弹更大，尽量直连。
+以下命令都在判决机的仓库目录里执行，先把两个变量设好：
 
-### 接线示例（开发卡实拍）
-
-卡背面 SMBus 分接点与 `PEX_RST` 的焊接位置（黄 = SDA，蓝 = SCL，红 = PEX_RST，U809/U810 区域）：
-
-![焊接点位标注](docs/images/wiring-points.png)
-
-同一机位无标注原图：
-
-![焊接点位原图](docs/images/wiring-points-closeup.png)
-
-焊好后整卡背面全景（飞线成组引出）：
-
-![接线后全图](docs/images/wiring-overview.png)
-
-桌面整体接线环境（毛刺小板 ↔ 卡 ↔ 主板）：
-
-![桌面接线](docs/images/bench-setup.png)
-
-## 固件与控制台
-
-ESP-IDF / Arduino 构建见 [docs/BUILD.md](docs/BUILD.md)。启动后 SoftAP `GA100VFI`
-（密码 `ga100glitch`，`http://192.168.4.1/`），组网后按启动日志的 LAN 地址使用。
-
-**初次点亮后建议先给 ESP32-S3 配网**（网页 Wi-Fi 设置或串口 `@W`），让它接入实验室/家里的
-现有 Wi-Fi，SoftAP 只作兜底。之后控制机（含卡所在主机）与板子在同一局域网，HTTP 接口、
-判决代理和网页面板随时可调、可实时观察；配一次终身生效，后续从打毛刺到烧写基本都是自动操作。
-下文示例中的 `192.168.4.1` 在配网后换成板子的 LAN 地址即可。
-
-HTTP 接口（`host/ga100vfi_agent.py` 即按此协议实现 Linux 判决代理）：
-
-| 端点 | 用途 |
-|---|---|
-| `POST /api/cmd`（body=命令行文本） | `u` 解锁 VRM 密码、`w` 回 PWM-VID、`r` PEX_RST 脉冲（=熔丝重感）、`g <参数>` 单发毛刺、`c` campaign |
-| `GET /api/status` | 板卡/网络/阶段/看门狗面包屑 |
-| `GET /api/campaign`（`op=start&…`/`op=stop`/查询） | 自适应爬山 campaign：`vd/td/vr/tr/batch/max/minv/maxv/step/pw/gap/pulses/wait/delays/mode` |
-| `GET /api/verdict` | 最近判决（携带 `session+attempt`，拒绝旧轮次） |
-| `GET /api/log?pos=` | 滚动日志 |
-| `POST /api/ota` | 固件升级 |
-
-## 主机接入：串口还是网络？
-
-板子有两个等价控制面：**UART0 串行控制台**（115200 8N1）和 **Wi-Fi/HTTP**。
-BAR0 判决永远在插着目标卡的 Linux 主机本地完成（`/sys/bus/pci/<bdf>/resource0` mmap 读取），
-ESP32 从不搬运 BAR0 数据。区别只在"谁驱动循环、判决怎么闭环"：
-
-| 方式 | 命令通路 | 判决通路 | 适用 |
-|---|---|---|---|
-| **A. 串口驱动**：`python -m ga100vfi attempt/campaign --port …` | 主机客户端经串口发 `u`/`g`/`w` | 同一台主机打完一发后**本地**读 BAR0 并分类，循环在主机脚本里 | 调试、首次打通 |
-| **B. 板载 campaign + 网络代理**：campaign 在板内运行（`mode=1`），`host/ga100vfi_agent.py` 跑在卡所在主机 | 代理与板子之间**纯 HTTP**（轮询 `GET /api/status`，提交 `GET /api/verdict?session=&attempt=&r=`），走 SoftAP 或 LAN | 代理本地读 BAR0 做分类，只把**判决字符串**（goldilocks/hit/under/over/lost）经网络回传；串口此时只承担日志 | 长时间自适应爬山、无串口环境 |
-
-两条路径的判决都绑定 `session+attempt`，过期轮次会被拒绝（HTTP 409）；代理对未确认结果幂等重试，不会为了重试重复执行寄存器分类。
-
-```sh
-# A. 串口驱动（attempt/campaign 的判决依赖与卡同机的 Linux sysfs）
-python -m ga100vfi campaign --port /dev/ttyACM0 --bdf 0000:01:00.0 --adaptive
-
-# B. 板载 campaign + HTTP 判决代理（先以 mode=1 启动流程，再跑代理）
-curl "http://192.168.4.1/api/campaign?op=start&mode=1&vd=300&td=-1000&batch=4&step=25"
-sudo python3 host/ga100vfi_agent.py http://192.168.4.1 --bdf 0000:01:00.0
+```bash
+export BOARD=http://<设备IP>                            # 板子串口横幅或 /api/status 的 net.ip
+export BDF=$(lspci -D -d 10de: | awk 'NR==1{print $1}') # 目标卡 BDF，多卡机自己确认是哪一个
 ```
 
-## 端到端实操流程
+### 1.1 准备
 
-### 1. 打毛刺命中 Goldilocks
+1. 按 §4 接线；刷入固件（§8 预编译固件，或按 [docs/BUILD.md](docs/BUILD.md) 自建）。
+2. 板子配网：SoftAP `GA100VFI` / `ga100glitch`（固件内置默认，出厂即此，接入后用串口 `@W` 或 `http://192.168.4.1/` 的 Wi-Fi 设置页改成自己网络的 SSID 与口令）。配网易后统一用板子的 LAN 地址 `<设备IP>`。
+3. 判决机部署（Windows 端一条命令，含落地自校验）：
 
-```
-u                                  # VRM 密码解锁（必须先于一切 w/g）
-g <vd> <td> <vr> <tr> 0 1 0 1 <pw> <gap> 0 1 <wait>   # 单发试打
-c op=start&vd=300&td=-1000&…&max=120&step=25          # 或自适应 campaign
-```
+   ```bat
+   set BENCH_HOST=<判决机IP>
+   set BENCH_USER=<判决机用户>
+   set BENCH_PW=<判决机口令>
+   python tools/deploy_bench.py
+   ```
 
-命中判据：BAR0 config-space 探活后 `CRC=0x55`、`DSOV=0`（脚本模板见「实测记录」与 `host/`）。
-经验（本卡）：单一长平型脉冲 `td=-1000 pw=15000`、`vd≈275–300`、`pulses=1`、命中前用
-`wait≈8000` 给 GSP 启动留时间；hit 率约 1/10。
+   三个变量都必须显式给出，缺任一即退出。部署会重装 `~/ga100vfi/{host,bench}`，并断言红线判据在包里、`bash -n` 全过、`FUSECTRL` 四态在机器上归类正确。台架脚本不放 `/tmp`：判决机每次重启清空 `/tmp`。
 
-### 2. 快照与烧写计划（窗口内，全部只读 + CMD_READ）
+4. 连通性与版本检查（板子必须自报本次镜像；`crack.sh` 会拒绝版本不符的板子）：
 
-计划与潜力分析用同作者仓库 **ffcalc**（`capture --read-ff-rows` → `gen` → `verify`，见其 README），
-快照/核验/烧写执行也可完全走本仓库自含工具（标准库，无外部依赖）：
+   ```sh
+   curl -s http://<设备IP>/api/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["net"]["build"])'
+   bash bench/poison_check.sh        # 只读一次 FUSECTRL
+   ```
 
-```sh
-python3 -m ga100vfi.burn --bdf 0000:01:00.0 status      # 窗口判据（只读）
-python3 -m ga100vfi.burn --bdf 0000:01:00.0 capture -o snapshot.json
-python3 -m ga100vfi.burn crosscheck snapshot.json plan.burn.json   # 必须 0 问题
-```
+   刷板走 `BOARD=http://<设备IP> bash bench/ota.sh`（另给 `IMG=<镜像路径> EXPECT=<镜像 sha256 前缀>`），它回读 `/api/status` 的 `net.build` 自证版本。版本链条的三处断言见 [bench/README.md](bench/README.md)。
 
-**烧前交叉验证清单**（`crosscheck` 自动做前四条，一次都不能省，全部可离线做）：
+### 1.2 建立解锁状态
 
-- 逐条重编码 `record == (new<<16)|(block<<6)|chain`，IFF 位（bit5）为 0；
-- 清位规则 `new & ~old == 0`；`old` 必须等于"现有 FF 记录按行序回放"的 chain.block 值，
-  且被新行覆盖的现有记录行号 < 新行号；
-- 目标行在快照中必须为 `0`（空白行读 0）；同一计划内 chain.block 不得重复；
-- 用 `ffcalc sim/gen` 重放"快照+计划"，得到的分析（FB GiB/SM/defective 底线）= 计划 `analysis`；
-- 与参考烧写表做**语义**比对（chain.block 与字段一致即可，行号因卡而异）；
-- 记下 `fingerprint`（defective 全字 + SBFE 的哈希）——它只认 die，烧前烧后必须一致
-  （Glitch 窗口内采集的快照 SBFE=0，冷启后正常启动 SBFE=1，指纹会因这一行换 key，属预期）。
-  **同批卡 defective 相同、出厂 SBFE 即为 1，指纹可与烧后完全相同**，多卡环境认卡用 UUID，
-  烧写时逐行对快照是最后一道闸。
+VRM 未解锁时每一发毛刺都在 `ensure_unlocked()` 门口返回，`PEX_RST` 不动，判决是对一张未被碰过的卡回 `under`。判据只看 `pwd`（`STATUS_CML(0x7E) & 0x08`）：
 
-### 3. 烧写（OTP 不可逆，宁可中止不可硬来）
+| 状态 | 现象 | 处置 |
+|---|---|---|
+| 无锁 | `pwd=1` | 直接开火，不再发 `u` |
+| 故障锁 | `pwd=0`，`z` 能读到 | 先 `@w 25 03`（`CLEAR_FAULTS`）再 `u`，无需断电 |
+| 总线无应答 | `z` 报 `ERR status read` | 查接线/地址/供电，与锁无关 |
+| 真死 | 先清故障再交密码仍 `pwd=0` | 拔 12V + 3V3 ≥30 s |
 
-一条命令执行完整断言链（`--rows 315` 先试烧单行；逐条 PROGRAM + 回读核验；控制器一报错锁死（读 `0xBADFxxxx`）立即停止，rc=3）：
+`bench/crack.sh` 已内置该判定；手工核对用 `bash bench/console.sh z`。裸打之前不发 `w`：`w` 把 VRM 交回 PWM-VID 后 `VOUT_COMMAND` 被压制，窗口出不来。
 
-```sh
-python3 -m ga100vfi.burn --bdf 0000:01:00.0 burn snapshot.json plan.burn.json --rows 315
-python3 -m ga100vfi.burn --bdf 0000:01:00.0 burn snapshot.json plan.burn.json --yes
+### 1.3 打毛刺，命中 Goldilocks
+
+```bash
+# BOARD 必须已在上面设好：crack.sh 缺 BOARD 直接退出 2，不会拿任何默认地址开火
+MAX=12 BATCH=2 VD=334 MINV=284 MAXV=384 STEP=25 DELAYS=54 \
+  bash $HOME/ga100vfi/bench/crack.sh
 ```
 
-每条记录内部的断言序列（等价实现另见 ffcalc `burntool`，规程见其 docs/BURNING.md）：
+默认参数即档案命中几何：`3 × 222 µs`、`gap 150 µs`、`delay=54`、锚点 `td=-40 vr=750 tr=-20`（首凹在 `PEX_RST` 释放前 94 µs，脉冲串在 0.9 ms 内结束，覆盖启动期熔丝采样窗）。本卡在该几何下 `vd=326`（PMBus 码 52）第 1 发命中。
+
+`vd` 以 PMBus 码写入，LSB = 6.25 mV：`vd=334` 与 `vd=330` 是同一个码 53，写进 VRM 的电压相同。换档必须跨过一个 LSB（334 → 326 → 319）。
+
+停止条件（`crack.sh` 已内置）：
+
+- 出现 `lost` 立即停火。`lost` 表示该发之后 PCIe 链路未起；此时控制器处于半死态，补一发实测得到 poison。
+- `FUSECTRL` 非 `IDLE`（含 `0xBADF…` 与叫不出名字的值）立即停火，不再读 BAR0。
+
+命中判据（全部满足）：`FUSECTRL=0xE0040000`、`DSOV(0x00820084)=0`、`CRC_STATUS(0x00820070)=0x55`、`NV_FUSE_OPT_PRIV_LEVEL_MASK(0x008200FC)=0xffffffff`、FPF 行读回 `0xffffffff`。
+
+### 1.4 窗口内取证（全部只读）
+
+窗口是易失的：发 `r`（`PEX_RST`）、加载 `nvidia` 驱动、热重启都会关闭窗口。取证期间只允许 `CMD_READ`。
+
+```bash
+bash bench/window.sh                                        # classify / baseline / burn status / capture
+cd $HOME/ga100vfi/host
+python3 -m ga100vfi.burn --bdf "$BDF" status          # 窗口判据
+python3 -m ga100vfi.burn --bdf "$BDF" capture -o rows.txt
+python3 -m ga100vfi.burn --bdf "$BDF" capture -o rows2.txt
+diff <(sort rows.txt) <(sort rows2.txt)                     # 必须 0 差异
+```
+
+512 行必须独立抓两遍并逐字节一致，不接受"只读一次就当真"。
+
+### 1.5 生成计划，并用 ffcalc 交叉验证
+
+四道闸门全部通过才允许进入 §1.6。ffcalc 与本仓库工具是两套独立实现，必须互相对账，不允许只信一套。
+
+```bash
+FFCALC=/path/to/ffcalc                       # ffcalc 仓库根目录
+cd "$FFCALC"
+python3 -m ffcalc.capture --bdf "$BDF" -o card-dump.json      # 61 个 option/defective/info 字
+python3 -m ffcalc mergeff card-dump.json $HOME/ga100vfi/host/rows.txt   # 合并 512 行，必须报覆盖完整
+python3 -m ffcalc gen card-dump.json -o plan.json
+python3 -m ffcalc sim card-dump.json plan.json                       # 必须 SIMULATION OK、0 error
+python3 -m ffcalc verify plan.json --dump card-dump.json             # 必须 OK: plan ... belongs to card（认 UUID/指纹）
+cd $HOME/ga100vfi/host
+python3 -m ga100vfi.burn --bdf "$BDF" crosscheck card-dump.json plan.json   # 必须 0 problems
+```
+
+`crosscheck` 独立复核的项（`host/ga100vfi/burn.py`）：
+
+1. 记录重编码 `record == (new<<16)|(block<<6)|chain`，IFF 位（bit5）为 0；
+2. 清位规则 `new & ~old == 0`（点亮 defective 位 = 上电即坏）；
+3. `old` 等于 512 行按行序回放的 `chain.block` 值，且新行号大于被覆盖的现有记录行号；
+4. 目标行在快照中为 `0`（空白行读 `0x00000000`，不是 `FF`），且同一计划内 `chain.block` 不重复；
+5. 烧后回放等于计划 `new`；
+6. 现场再逐行 `CMD_READ` 一次，目标行仍为空白。
+
+FF 记录格式：`record[4:0]=chain`、`record[15:6]=block`、`record[31:16]=data`、bit5（IFF）必须为 0。FF 行范围 222–486。
+
+认卡用 UUID；fingerprint 是 `*_defective` 全字 + SBFE 位的哈希，只用于确认"烧前烧后同一块 die"——同批卡 defective 相同、出厂 SBFE 可为 1，指纹可与他人卡相同。
+
+### 1.6 烧写（分两批：先 1 条，再其余）
+
+前提：`crosscheck` 为 `0 problems`；`burn` 子命令内部仍会重复全部离线断言、`window_ok()`、`sense()`、`arm()` 七项授权断言（`FUSECTRL=IDLE`、`FUSEDEBUG=0`、`CRC=0x55`、`EFP=1`、`DSOV=0`、`SBFE=0`、`WDATA_WR_SECURE=0`、`FUSEWDATA` 读回 0），任一项不满足即拒绝写入。
+
+`EFP_STATUS(0x00820078)` 在刚进窗口时读 0，发过一次 `CMD_SENSE` 才为 1。`ga100vfi.burn` 在 `arm()` 前自动 `sense()`；ffcalc `burntool` 的 `in_write_window()` 硬要求 `EFP==1`，刚进窗口时会被它拒 burn——先发一次 `sense` 即可，不要判成"窗口坏了"。
+
+**第一批：1 条。** 用计划中的 `fbp_disable`/`rop_l2_disable` 记录（本卡为行 307，`0x420004c1`，与 ffcalc 参考卡首次试烧同一条记录）：
+
+```bash
+python3 -m ga100vfi.burn --bdf "$BDF" burn card-dump.json plan.json --rows 307
+python3 -m ga100vfi.burn --bdf "$BDF" capture -o rows_after_1.txt
+```
+
+复核判据（不满足即停手，不烧第二批）：`rows_after_1.txt` 相对 `rows.txt` **只有行 307 变化**，且该行等于 `0x420004c1`；`status` 的 `CRC` 仍 `0x55`、`DSOV` 仍 `0`、`FUSECTRL` 仍 `IDLE`、无 `0xBADF…`。
+
+**第二批：其余全部。** 已烧行必须从 `--rows` 里排除——空白检查会拒绝重写已烧行。快照参数仍用烧前的 `card-dump.json`（计划中的 `old` 与空白判据都以烧前状态为准）：
+
+```bash
+python3 -m ga100vfi.burn --bdf "$BDF" burn card-dump.json plan.json \
+        --rows 297,298,299,300,301,302,303,304,305,306,308,309,310,311,312
+python3 -m ga100vfi.burn --bdf "$BDF" capture -o rows_after_all.txt
+```
+
+复核判据：相对 `rows.txt` **恰好 16 行变化、其余 496 行零改动**，16 行逐条等于计划 `record`；每条记录烧完后控制器回 IDLE（实测约 1 ms，期间可见 `0xE00C0000`）。中途出现 `0xBADF…` 或超时 → 立即停手，转 §3 恢复流程，未烧的行下次窗口继续。
+
+单条记录的断言序列（`host/ga100vfi/burn.py`，ffcalc `burntool` 为等价实现）：
 
 ```
-0) 断言: FUSECTRL==0xE0040000, FUSEDEBUG==0, CRC==0x55, DSOV==0
-1) wr FUSECTRL=3 (SENSE_CTRL)，轮询回 IDLE；断言 DSOV 仍为 0
-2) arm:  wr SBFE(0x821108)=0 → wr WDATA_WR_SECURE(0x82048C)=0（PLM 自动全开）
-3) 断言全齐: FUSECTRL=IDLE FUSEDEBUG=0 CRC=0x55 EFP=1 DSOV=0 SBFE=0
-             WDATA_WR_SECURE=0 WDATA写口读回=0
-4) wr FUSEADDR=row（回读核对）→ wr FUSEWDATA(0x82000C)=record → wr FUSECTRL=2
-5) 轮询回 IDLE（实测 ~1 ms；期间可见 0xE00C0000；读到 `0xBADFxxxx` 或超时 → 停手，断电重启）
+0) 断言 FUSECTRL=IDLE, FUSEDEBUG=0, CRC=0x55, DSOV=0
+1) CMD_SENSE(3)，轮询回 IDLE，断言 DSOV 仍 0
+2) arm：SBFE_SHADOW(0x00821108)=0 → WDATA_WR_SECURE(0x0082048C)=0（PLM 自动全开）
+3) 七项授权断言全齐
+4) FUSEADDR=row（回读核对）→ FUSEWDATA(0x0082000C)=record → FUSECTRL=2
+5) 轮询回 IDLE；0xBADF… 或超时即停
 6) CMD_READ 该行，回读 == record；断言 CRC/DSOV 未变
 ```
 
-纪律：**先烧 1 行测试**（建议 fbp 那条），验证回读与邻行未动，再烧其余；
-每条记录之间重复第 3) 步断言；任何不满足 → 停止（未烧的行下次窗口继续）。
+### 1.7 冷启验收
 
-### 4. 冷启与复验
+`PEX_RST` 让卡重新解析 FF 链，等价于完整冷启动，无需断电：重启判决机（POST 拉一次 `PERST#`）即触发 devinit 重解析。正式验收另做一次整机断电 ≥30 s。
 
-- 快捷通道：给板子发 `r`（PEX_RST 重感）。熔丝链立即重放——窗口作废，但可当场验证回放；
-- 正式通道：**整机断电 ≥30 s** 再上电；
-- 复验（全部应有）：卡正常枚举、`BOOT0=0x170000a1`、`CRC=0x55`、`DSOV=1`、`SBFE=1`；
-  重新快照 → 17 行逐位一致、FF 区（222–486）其余行一字未动、defective 字不变、
-  `gen` 重生成计划 = **0 条记录**；记录正常启动口径的新指纹（此后固定不变）。
-
-### 5. 安全红线（全部来自实际事故或上游事故）
-
-1. 控制器锁死（读到 `0xBADF…`）之后**不要再读 BAR0**——会挂死 PCIe 上游、整机复位；
-2. FUSECTRL 非 IDLE 不许发下一条命令；
-3. 记录编码/清位规则/空白行三查缺一不烧；写错 chain.block 就是永久改坏未知字段；
-4. 永不直接写 PLM（`0x8200F4/F8/FC`）；用 WDATA_WR_SECURE=0 让 PLM 自动全开；
-5. 驱动加载或 `PEX_RST` 都会终结窗口——计划、脚本、交叉验证在开窗前全部就绪；
-6. `new & ~old == 0`：熔丝只能追加清位，点亮 defective 位 = 上电即坏。
-
-## 实测记录（本仓库开发卡）
-
-- 卡：CMP 170HX 8 GB（10de:20c2，die 指纹 `2d827969bc5001f4`），P1 板型 host `0000:01:00.0`；
-- 命中：campaign `vd=300 td=-1000 vr=700 tr=3000 batch=4 pw=15000 gap=1500 pulses=1 wait=8000
-  step=25 minv=250 maxv=450 delays=0,1600,3200,4800,6400,8000`，第 10 次尝试，自适应 `vd=275`；
-- 烧写：17 条记录（行 304–320；fbio/fbpa/gpc/tpc/pes/fbp/rop_l2/nvlink/sys_pipe + PCIe
-  2.39/2.47/2.49），全部一条命令一轮回 IDLE，未出现锁死；测试行 = fbp `0x420004c1`（row 315）；
-- 冷启复验：17 行逐位一致；FF 区零意外改动；defective 16 字不变；fused 层 = 计划目标
-  （`tpc_gpc3/6` status 层 0x1 为原厂固件运行时自掩蔽，参考机同款表现）；
-  重生成计划 0 条，potential **80 GiB FB / 108 SM / NVLink / Gen4**；
-  正常启动口径永久指纹 `3ab5093e8f9f78b5`；
-- 未烧 MAGIC_D（chain 2 block 46/47）：该记录对带宽/Gen4 无收益，
-  仅在刷 A100 VBIOS 时需要——保持保守，不烧。
-
-## 后续阶段（熔丝之外）
-
-熔丝解锁只解除 floorsweep；**80 GiB 显存显现**与 **Gen4 链路**属驱动层（阶段二/三），
-用 [cmpunlocker](https://github.com/amoghunikote/cmpunlocker)（补丁驱动 615.71.09 +
-`CMPUNLOCKER_CARD_PROFILE=mixed`，每次开机重写几何；Gen4 用其 RMPcieLinkSpeed/E1 重训路径），
-要点见其仓库文档。
-
-## 已知问题
-
-- campaign 运行中执行 `op=stop` 若恰逢毛刺执行中，存在停止竞态 → TWDT 复位（卡会自己回来，
-  板子重启；修复排期中）。规避：等当前 attempt 判决出来再 stop。
-
-## 预编译固件
-
-`firmware/` 提供本版交叉编译产物（Arduino-ESP32 3.3.11 / ESP32-S3，Flash 16 MB、OPI PSRAM）：
-
-- `esp32-ga100vfi-0.2.0-merged.bin`：**全刷镜像**（bootloader + 分区表 + OTAboot + app，16 MiB），整片写到偏移 0 即可；
-- `esp32-ga100vfi-0.2.0-app.bin`：应用固件，用于网页/`POST /api/ota` 升级（首次上板请先全刷）。
-
-```sh
-esptool.py --chip esp32s3 -p <串口> -b 921600 write_flash 0x0 esp32-ga100vfi-0.2.0-merged.bin
+```bash
+python3 -m ffcalc.capture --bdf "$BDF" -o card-post.json
+python3 -m ffcalc mergeff card-post.json rows_after_all.txt
+python3 -m ffcalc gen card-post.json -o plan-post.json     # 必须 0 条
+python3 -m ffcalc report card-post.json                     # 潜力必须到顶：80 GiB / 124 SM
 ```
 
-## 已知边界 / 声明
+应有读数：`BOOT0=0x170000a1`、`CRC=0x55`、`DSOV=1`、`SBFE=1`；14 个 option 影子寄存器等于计划目标；`*_defective` 全部不变；FF 区除新 16 行外零改动。`CMD_SENSE` 不刷新 option 影子寄存器（只在 devinit 重算），所以生效验证必须走 `PEX_RST`。
 
-- `--port auto` 仅按已知 Espressif/Raspberry Pi USB VID 查找；外接 TTL 请显式指定串口。
-- Linux BAR0 判决需要在插有目标卡的主机运行并正确指定 BDF。
-- 复位时间轴由软件调度；`slip`/`reset_slip` 报告执行偏差，不保证确定性硬件时序（见 [docs/CALIBRATION.md](docs/CALIBRATION.md)）。
-- `firmware/` 镜像为交叉编译产物；该版本未做实板刷写回归，红线与断言链照常适用。
-- 熔丝烧写**不可逆**：请完整读完「安全红线」并逐条满足后再动手；本项目的实测结论
-  （命令值、空白行=0、寄存器表）来自单卡单次样本，按"可复现假设"对待。
+已知正常现象：`tpc_gpc5/tpc_gpc7` 的 status 层为 1、fused 层为 0（原厂固件运行时自屏蔽，ffcalc `docs/BURNING.md` §5 有同款记录），不补烧。
 
-## 仓库与开发
+### 1.8 熔丝之外
+
+FF 只解除 floorsweep。`nvidia-smi` 的几何显现与 Gen4 链路属驱动层（阶段二/三），用 [cmpunlocker](https://github.com/amoghmunikote/cmpunlocker)（补丁驱动 + `CMPUNLOCKER_CARD_PROFILE=mixed`，Gen4 走其 RMPcieLinkSpeed/E1 重训），与本仓库无关。
+
+---
+
+## 2. 判据与寄存器
+
+BAR0 偏移，全部实机确认：
+
+| 寄存器 | 偏移 | 说明 |
+|---|---|---|
+| `FUSECTRL` | `0x00820000` | 低 5 位写命令；FSM 状态在 `bits[20:16]`，IDLE = `0xE0040000`，PROGRAM 中可见 `0xE00C0000`，`0xBADFxxxx` = 控制器锁死 |
+| `FUSEADDR` | `0x00820004` | 行号 0–511，读写行前写它，读完恢复 |
+| `FUSEDATA` | `0x00820008` | 只读数据口（写这里静默丢失） |
+| `FUSEWDATA` | `0x0082000C` | 记录写入口 |
+| `FUSEDEBUG` | `0x00820060` | 必须为 0 |
+| `CRC_STATUS` | `0x00820070` | `0x55` = 镜像有效（H0/H1 均通过）；烧写后由控制器自动重算 |
+| `EFP_STATUS` | `0x00820078` | 冷启后读 0，`CMD_SENSE` 后为 1 |
+| `DSOV_STATUS` | `0x00820084` | Goldilocks 窗口内 = 0 |
+| `NV_FUSE_OPT_PRIV_LEVEL_MASK` | `0x008200FC` | Goldilocks 下 `0xffffffff` |
+| `SBFE_SHADOW` | `0x00821108` | `DSOV=0` 时可写；写 0 = 授权烧写；冷启恢复 1 |
+| `WDATA_WR_SECURE` | `0x0082048C` | 写 0 → `PLM_FUSE` 自动全开（不得直写 `0x8200F4/F8/FC`） |
+
+| 命令（写 `FUSECTRL` 低 5 位） | 值 | 实测行为 |
+|---|---:|---|
+| `CMD_READ` | 1 | 读 `FUSEADDR` 行到 `FUSEDATA`，数十 µs 回 IDLE；空白行读回 `0x00000000` |
+| `CMD_PROGRAM` | 2 | 约 1 ms 回 IDLE |
+| `CMD_SENSE` | 3 | 重解析 OTP→影子：EFP/SBFE 回融合值 1，`DSOV` 保持 0；不刷新 option 影子寄存器 |
+
+`FUSECTRL` 四态判据（`host/ga100vfi/classify.py` `fusectrl_state()`，判决链、战役循环、台架脚本共用同一函数）：
+
+| 读数 | 状态 | 处置 |
+|---|---|---|
+| `0xE0040000` | `idle` | 放行 |
+| `0xFFFFFFFF` | `unreachable` | 判 `lost`，卡不在总线上；连号 `lost` 停战 |
+| `0xBADFxxxx` | `poisoned` | 停手，禁止再读 BAR0 |
+| 其他（实测 `0x00000000`） | `unknown` | 停手。该状态出现后同电压下一发实测为 poison |
+
+`unreachable` 必须先于 `poisoned` 判定：`0xFFFFFFFF` 的状态位同为 31。
+
+---
+
+## 3. 安全红线
+
+1. `FUSECTRL` 为 `0xBADFxxxx` 后不再读 BAR0：继续读会挂死 PCIe 上游、整机复位（事故 `logs/02`）。判决链已固化为代码：`classify()` 第一件事只读一次 `FUSECTRL`，命中即抛异常、停战役并退出，不存在"再读一次确认"。
+2. `FUSECTRL` 非 IDLE 不发下一条命令。
+3. 记录编码、清位规则、空白行三查缺一不烧。写错 `chain.block` 即永久改坏未知字段。
+4. 永不直写 PLM（`0x8200F4/F8/FC`）；用 `WDATA_WR_SECURE=0` 让 PLM 自动全开。
+5. 驱动加载或 `PEX_RST` 都会终结窗口：计划、脚本、交叉验证在开窗前全部就绪。
+6. `new & ~old == 0`：熔丝只能追加清位。
+7. 未解锁不开火（`pwd=0` 时 `PEX_RST` 不动，买到的是假 `under`）。
+8. `writes_failed=1` 表示"根本没打出去"，不是"参数不对"。
+9. 网格必须 `max ≥ ndelays × batch`，否则整个网格塌在一个电压点上。`bench/crack.sh` 开火前算并拒绝。
+10. 恢复顺序：先重启判决机（POST 拉 `PERST#`），仍不可达再拔 12V + 3V3 ≥30 s。
+11. 首次命中后先单烧 1 条并复核，再烧其余。已烧行不重写。
+
+判据成因与实测证据：[docs/UNLOCK_AND_POISON.md](docs/UNLOCK_AND_POISON.md)。
+
+---
+
+## 4. 硬件与接线
+
+| 功能 | GPIO |
+|---|---:|
+| I²C SDA（→ VRM 控制器 MP2888B SMBUS） | 47（本台架接线；通用板建议 6） |
+| I²C SCL | 48（本台架接线；通用板建议 7，许多 S3 板的 48 被板载 WS2812 占用） |
+| `PEX_RST`，开漏输出 | 10 |
+| UART0 TX / RX（控制台，115200 8N1） | 43 / 44（S3 默认，未重映射） |
+
+引脚定义集中在 [main/board.h](main/board.h)，改引脚只改这三行。内含编译期检查：0/3/45/46（strapping）、19/20（原生 USB）、26–32（SPI flash）、33–37（octal flash/PSRAM，需 `GA_ALLOW_OCTAL_PINS` 显式放行）一律拒绝；三个角色不得共用一个引脚。若按上表接线后总线读不到 ACK，先查接触与上拉，再怀疑代码：固件不占用其他引脚。
+
+ESP32-S3 不挑板子：任意 ESP32-S3 开发板按上表接线、刷入固件即可。本仓库开发卡的毛刺板为早前 openUPS 项目遗留模组，非必需规格。SDA/SCL 接插件必须压实：总线"全死"最常见的原因是接触不良。
+
+两条硬件不变量：
+
+- `PEX_RST` 是 1.8 V 网络，ESP32-S3 pad 是 3.3 V。该线只允许拉低或释放（高阻），任何情况下不得输出高电平、不得改成推挽驱动。固件中它终身固定为 `GPIO_MODE_OUTPUT_OD`，改代码必须保持该不变量。
+- strapping 脚（0/3/45/46 等）在上电或下载模式下会被内部弱上拉拉高，不接 `PEX_RST`，也不接 SMBus。
+
+GND：显卡与毛刺板之间直接接一根 GND 线。经主板/供电共地只作退路，回路绕远、毛刺期间地弹更大。
+
+实拍（黄 = SDA，蓝 = SCL，红 = `PEX_RST`，U809/U810 区域）：
+
+![焊接点位标注](docs/images/wiring-points.png)
+
+![焊接点位原图](docs/images/wiring-points-closeup.png
+
+![接线后全图](docs/images/wiring-overview.png)
+
+![桌面接线](docs/images/bench-setup.png)
+
+---
+
+## 5. 固件、控制台与 HTTP
+
+构建见 [docs/BUILD.md](docs/BUILD.md)。`/api/status` 的 `build` 字段与启动横幅都取 `main/board.h` 的 `GA_FW_VERSION`（当前 `0.3.0`）。证明"板上跑的是哪份镜像"用该字段 + `uptime`（重启后应为个位数秒）。
+
+BAR0 判决永远在插着目标卡的 Linux 主机本地完成（mmap `/sys/bus/pci/<bdf>/resource0`），ESP32 不搬运 BAR0 数据。控制面有两个等价入口：
+
+| 方式 | 命令通路 | 判决通路 | 适用 |
+|---|---|---|---|
+| A. 串口驱动 `python -m ga100vfi attempt/campaign --port …` | 主机经串口发 `u`/`g`/`w` | 同机打完一发后本地读 BAR0 分类 | 调试、首次打通 |
+| B. 板载 campaign（`mode=1`）+ `host/ga100vfi_agent.py` | 代理与板子纯 HTTP：轮询 `GET /api/status`，提交 `GET /api/verdict?session=&attempt=&r=` | 代理本地读 BAR0 分类，只回传判决词 | 长时间爬山、无串口环境 |
+
+两条路径的判决都绑定 `session+attempt`，过期轮次返回 HTTP 409；代理对未确认结果幂等重试，不为重试重复执行寄存器分类。
+
+```sh
+# A：--port 是 TTL 适配器设备名（Linux 常见 /dev/ttyACM0 或 /dev/ttyUSB0）
+python -m ga100vfi campaign --port <串口> --bdf "$BDF" --adaptive
+# B：<设备IP> 未配网时是 SoftAP 出厂地址 192.168.4.1，配网后换成板子的 LAN 地址
+curl "http://<设备IP>/api/campaign?op=start&mode=1&vd=326&td=-40&vr=750&tr=-20&pw=222&gap=150&pulses=3&delays=54&batch=2&max=12&step=25"
+sudo python3 host/ga100vfi_agent.py http://<设备IP> --bdf "$BDF"
+```
+
+| 端点 | 用途 |
+|---|---|
+| `POST /api/cmd`（body=命令行文本） | `u` 解锁 VRM、`w` 回 PWM-VID、`r` PEX_RST 脉冲、`g <参数>` 单发、`c` campaign |
+| `GET /api/status` | 板卡/网络/阶段/看门狗面包屑、`build` |
+| `GET /api/campaign`（`op=start|stop`/查询） | 自适应 campaign：`vd/td/vr/tr/batch/max/minv/maxv/step/pw/gap/pulses/wait/delays/mode` |
+| `GET /api/verdict` | 提交判决（携带 `session+attempt`，拒绝旧轮次） |
+| `GET /api/log?pos=` | 滚动日志 |
+| `POST /api/ota` | 固件升级 |
+
+---
+
+## 6. 台架脚本
+
+`bench/` 下，`python tools/deploy_bench.py` 装到判决机 `$HOME/ga100vfi/bench/`。用法与闸门见 [bench/README.md](bench/README.md)。
+
+| 脚本 | 作用 | 写硬件 |
+|---|---|---|
+| `crack.sh` | 开火入口：网格闸门 + 三道预检 + campaign + 跨轮台账 | 是 |
+| `window.sh` | 命中后取证（classify / baseline / burn status / capture） | 只读（含 `classify` 固有的一次 DSOV 写） |
+| `poison_check.sh` | 只读一次 `FUSECTRL` | 只读一个寄存器 |
+| `card_probe.sh` | 卡在不在、桥链路、残留驱动 | 只读 |
+| `link_retrain.sh` | 对**桥**发 Retrain + rescan | 写桥，不碰卡 |
+| `readtrip.sh` | 零发实验：重放判决链访问，判是否我们自己的读写打进 poison | 是（判决链原样） |
+| `mkledger.sh` | 跨轮台账 `(delay,vd) → 判决` | 否 |
+| `ota.sh` | 刷板并回读 `build` 自证版本 | 刷固件，不碰卡 |
+| `console.sh` | UART0 控制台助手 | 取决于所发命令 |
+
+---
+
+## 7. 实测记录
+
+### 本仓库开发卡（0.3.0，2026-11-20）
+
+- 卡：CMP 170HX 8 GB，`10de:20c2`，BDF `0000:01:00.0`，烧前指纹 `58bf9ac855da7053`，烧后 `fc497d01b8255867`（SBFE 0→1）；
+- 命中：档案几何，第 1 发 `vd=326`（PMBus 码 52）、`delay=54`；
+- 烧写：16 条记录，行 297–312（`fbio`/`fbpa`/`gpc`/`tpc0..7`/`pes`/`fbp`/`rop_l2`/`nvlink`/`sys_pipe` + chain2 的 3 条 PCIe 位）；先烧行 307，复核后烧其余 15 条；全程 `CRC=0x55`、无 poison；
+- 冷启验收：14/14 option 影子寄存器等于计划目标，`gpc_disable=0x0`、`fbp_disable=0x840`、`rop_l2_disable=0xc03000`、`pes_disable=0x0`、`fbio/fbpa=0xc03000`，`fbp_defective=0x840` 原样保留；
+- 重扫：`ffcalc gen` 剩余计划 **0 条**，潜力 `80 GiB / 124 SM / usable_fbp=10`，`FF rows: 91 used, 174 free`；
+- 链路：`LnkSta` 仍 `2.5GT/s ×2`。该卡出厂为 Gen1 x4，x16 需 PCIe 电容改造，与 FF 无关；
+- 现场证据：`burnplan/`（`plan.json`、`card-dump.json`、`crosscheck_report.md`、`after_row307.json`、`after_all16.json`、`snapshot_post.json`、`plan-post-empty.json`、ffcalc `verify`/`sim` 输出）。
+
+### 参考样例卡（`host/samples/`）
+
+`bench-card-85b20be7.json` + `.burn.json`：17 条记录，行 304–320，指纹 `3ab5093e8f9f78b5`，潜力 `80 GiB / 108 SM`。`host/tests/test_burn.py` 直接核对该计划。`tpc_gpc3/6` 的 status 层 0x1 / fused 层 0x0 为原厂固件运行时自屏蔽，属正常。
+
+### 未烧项
+
+`MAGIC_D`（chain2 block 45/46/47）不参与本卡计划的字段收益时不烧；本卡仅 `pcie_magic_gen4_dis`（= `magic_d` 的 bit25）随 Gen4 位一起被清，`magic_d` 因此从 `0x16680000` 变 `0x14680000`，属同一改动的必然结果。
+
+---
+
+## 8. 仓库、构建与固件
 
 | 路径 | 用途 |
 |---|---|
-| `main/` | 固件唯一维护源：命令、状态机、总线、网络及网页源文件 |
-| `arduino/ga100vfi/` | Arduino sketch 和同步后的固件副本 |
-| `host/` | Python 串口客户端、Linux 判决代理、集成烧写/核验工具（`ga100vfi.burn`）及离线测试 |
-| `host/samples/` | 真实 bench 卡快照 + ffcalc 计划（回归测试样例，`host/tests/test_burn.py` 直接核对该计划） |
-| `test/` | 本机 C 回归测试、外设替身与统一测试入口 |
-| `tools/` | Arduino 源码同步、网页头文件生成 |
-| `docs/` | 构建、协议、测量限制与测试结果 |
-| `firmware/` | 本版预编译全刷/app 镜像（含 zip） |
-| `partitions.csv` | N16R8 的 16 MB Flash 布局，含两个 3 MiB OTA 应用分区 |
+| `main/` | 固件唯一维护源：命令、状态机、总线、网络、网页源文件 |
+| `arduino/ga100vfi/` | Arduino sketch 与同步后的固件副本（`python tools/sync_arduino.py` 生成） |
+| `host/` | 串口客户端、Linux 判决代理、`ga100vfi.burn` 集成烧写/核验工具及离线测试 |
+| `host/samples/` | 参考卡快照 + ffcalc 计划（回归样例） |
+| `test/` | 本机 C 回归测试、外设替身、统一测试入口 |
+| `bench/` | 判决机台架脚本（见 bench/README.md） |
+| `tools/` | `sync_arduino.py`、`gen_webui.py`、`deploy_bench.py`、`gen_manifest.py`、`package_firmware.py`、`pack_src_tests.py` |
+| `docs/` | 构建、架构与时序限制、测试结果、解锁与 poison |
+| `burnplan/` | 本轮解锁的权威证据 |
+| `firmware/` | 本版预编译镜像 |
+| `partitions.csv` | N16R8 的 16 MB Flash 布局，两个 3 MiB OTA 应用分区 |
 
 ```sh
-python test/run_tests.py
-python tools/gen_webui.py
-python tools/sync_arduino.py
+python test/run_tests.py            # 离线 C + Python 回归（无编译器时用 tools/pack_src_tests.py --run）
+python tools/gen_webui.py           # 改网页后
+python tools/sync_arduino.py        # 改 main/*.c|h 后必须执行
 python -m pip install -e host
+python tools/deploy_bench.py        # 部署判决机（含红线与版本一致性断言）
+python tools/pack_src_tests.py --run   # 判决机上跑 C 回归（退出码即门禁）
+python tools/gen_manifest.py        # 重新生成 MANIFEST.sha256
 ```
 
-`main/` 是固件唯一维护源，`arduino/ga100vfi/` 中的 `.c/.h` 由 `sync_arduino.py` 生成。
-本版主要变化（详见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)）：命令按完整行入队并拒绝非法输入；
-单一硬件任务串行化总线操作；判决携带 `session+attempt`；遥测解析修复；
-记录复位释放时间与执行偏差；I²C 改用 GPIO6/7；离线测试记录见 [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md)。
+发布门禁（依次通过才算一版）：
+
+```sh
+python tools/sync_arduino.py
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" --build-path build-arduino arduino/ga100vfi
+python tools/package_firmware.py --prune     # 按 board.h 版本打包，写 firmware/RELEASE.json
+python tools/package_firmware.py --check     # 发布的镜像必须来自当前固件源码
+python tools/pack_src_tests.py --run         # OFFLINE REGRESSIONS PASSED
+python tools/deploy_bench.py                 # 台架与红线断言
+python tools/gen_manifest.py                 # 重新生成 MANIFEST.sha256
+python tools/gen_manifest.py --check         # 清单必须覆盖当前跟踪文件
+```
+
+`firmware/RELEASE.json` 记录版本、镜像内构建串（`X.Y.Z (Mon DD YYYY HH:MM:SS)`，由 `main/board.h` 的 `GA_BUILD_STAMP` 印入）、每个镜像的 sha256、固件源码摘要与构建时的 git 状态。构建串说明"是哪一次编译"，源码摘要说明"输入是哪些文件"；`--check` 用后者拒绝"源码改了但镜像还是旧的"（CRLF 差异不计入摘要，跨平台检出结果一致）。`git` 一栏是打包那一刻的工作树状态：`commit` 是当时的 `HEAD`，`dirty: true` 表示工作树相对该提交有改动，因此镜像不能等同于那次提交——要一份可复现的发布镜像，先提交再打包。
+
+`MANIFEST.sha256` 记录 git 规范化内容的哈希（不含自身），Windows 与 Linux 检出结果一致；新增/改名/删除文件后 `--check` 会点名具体文件。
+
+app 镜像用于网页 / `POST /api/ota`，本仓库开发板当前即运行该镜像（`net.build = 0.3.0 (Nov 20 2026 12:37:25)`）；
+
+- merged 镜像（bootloader + 分区表 + OTAboot + app）用于首次上板整片刷写到偏移 0。
+
+```sh
+esptool.py --chip esp32s3 -p <串口> -b 921600 write_flash 0x0 esp32-ga100vfi-0.3.0-merged.bin
+```
+
+重新出镜像：`python tools/package_firmware.py --prune`（版本取 `main/board.h`，产物名随之变化），然后 `python tools/gen_manifest.py`。
+
+---
+
+## 9. 边界与已知问题
+
+- `--port auto` 仅按已知 Espressif/Raspberry Pi USB VID 查找；外接 TTL 需显式指定串口。
+- Linux BAR0 判决需在插有目标卡的主机运行并正确指定 BDF。
+- 复位时间轴由软件调度；`slip`/`reset_slip` 报告执行偏差，不承诺确定性硬件时序（[docs/CALIBRATION.md](docs/CALIBRATION.md)）。
+- campaign 运行中执行 `op=stop` 若恰逢毛刺执行中，存在停止竞态 → TWDT 复位（卡与板子自行恢复）。规避：等当前 attempt 判决出来再 stop。
+- 实测结论（命令值、空白行=0、寄存器表、电压窗口）来自单卡样本，按"可复现假设"对待。
+
+---
 
 ## 许可
 
-本仓库代码与文档采用 **Unlicense**（见 [LICENSE](LICENSE)）：公有领域，不保留版权。
-引用的上游实现与外部研究（dalzyu/pico-ga100vfi、kate-land、amoghmunikote、hexkyz 等）版权归各自作者。
-文中提及的商标（NVIDIA、GA100、CMP 等，以及乐鑫/Espressif 相关标识）均为相应权利人财产，提及仅为说明用途，不构成背书或隶属关系。
+本仓库代码与文档采用 **Unlicense**（见 [LICENSE](LICENSE)）：公有领域，不保留版权。引用的上游实现与外部研究（dalzyu/pico-ga100vfi、kate-land、amoghmunikote、hexkyz 等）版权归各自作者。文中提及的商标（NVIDIA、GA100、CMP 等，以及乐鑫/Espressif 相关标识）均为相应权利人财产，提及仅为说明用途，不构成背书或隶属关系。

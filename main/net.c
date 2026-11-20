@@ -354,7 +354,8 @@ static esp_err_t uri_status(httpd_req_t *r)
     wifi_ap_record_t ap;
     int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
     int n = snprintf(s_status_buf, sizeof s_status_buf,
-             "{\"net\":{\"sta\":%s,\"ip\":\"%s\",\"rssi\":%d,\"ap\":\"%s\"},"
+             "{\"net\":{\"sta\":%s,\"ip\":\"%s\",\"rssi\":%d,\"ap\":\"%s\","
+             "\"build\":\"" GA_BUILD "\"},"
              "\"board\":%s,\"campaign\":%s}",
              up ? "true" : "false", ip, rssi, GA_AP_SSID, board, camp);
     if (n < 0 || n >= (int)sizeof s_status_buf)

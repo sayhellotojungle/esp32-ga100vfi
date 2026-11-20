@@ -7,8 +7,18 @@ import sys
 import time
 
 from .bar0 import DEFAULT_BDF, Bar0, restore
-from .classify import attempt_outcome, classify, snapshot
+from .classify import (STATE_POISONED, STATE_UNKNOWN, FuseControllerStop,
+                       attempt_outcome, classify, fusectrl_state, snapshot)
 from .glitch import Attempt, Card
+
+
+POISON_EXIT = 4
+
+
+def _poison_report(exc) -> int:
+    """Loud, actionable, and above all *final* (README 安全红线 1, incident logs/02)."""
+    print(f"STOP: {exc}", file=sys.stderr)
+    return POISON_EXIT
 
 
 def cmd_classify(args) -> int:
@@ -16,7 +26,10 @@ def cmd_classify(args) -> int:
         print(f"{args.bdf}: GPU config space unreachable (0xffffffff)", file=sys.stderr)
         return 2
     with Bar0(args.bdf) as bar:
-        verdict = classify(bar)
+        try:
+            verdict = classify(bar)
+        except FuseControllerStop as exc:
+            return _poison_report(exc)
     print(json.dumps(verdict.as_dict(), indent=2))
     return 0 if verdict.passed else 1
 
@@ -26,7 +39,11 @@ def cmd_baseline(args) -> int:
         print(f"{args.bdf}: GPU config space unreachable (0xffffffff)", file=sys.stderr)
         return 2
     with Bar0(args.bdf) as bar:
-        print(json.dumps(snapshot(bar), indent=2))
+        try:
+            data = snapshot(bar)
+        except FuseControllerStop as exc:
+            return _poison_report(exc)
+    print(json.dumps(data, indent=2))
     return 0
 
 
@@ -102,9 +119,18 @@ def cmd_campaign(args) -> int:
 
     with Card(args.port) as card:
         if not args.no_unlock and not _ensure_unlocked(card):
-            print("unlock failed: controller locked until VDD33 cycles",
+            # Do not call this "locked until VDD33 cycles": that sentence sent an operator
+            # away to pull the card's power for what was an ordering bug. The controller
+            # refuses the password while a fault is latched, and CLEAR_FAULTS (0x03) is the
+            # way out -- the firmware does it in that order from this commit on; until the
+            # board is reflashed, send `@w 25 03` from the console before `u`.
+            print("unlock failed: VRM 无应答或拒绝密码（先试串口 `@w 25 03` 再 `u`；"
+                  "只有清完故障仍 pwd=0 才需要考虑断电）",
                   file=sys.stderr)
             return 2
+        # Set when the fuse controller reports itself poisoned: the loop stops there,
+        # because the next BAR0 read is what hangs the upstream (README 红线 1).
+        poisoned_stop = False
         try:
             while args.max_attempts <= 0 or tries < args.max_attempts:
                 if verdict is not None:
@@ -127,6 +153,18 @@ def cmd_campaign(args) -> int:
                     outcome = "lost"
                     if restore(args.bdf, wait_s=args.restore_wait):
                         with Bar0(args.bdf) as bar:
+                            # Red line 1: the controller is asked before the presence probe,
+                            # because the probe is itself a BAR0 read and a tripped controller
+                            # answers that by hanging the PCIe upstream (logs/02).
+                            # 2026-11-20 起判据扩到第三种态：非 IDLE、非 0xBADF 也不判决、不开火。
+                            state = fusectrl_state(bar.rd32(FUSECTRL))
+                            if state in (STATE_POISONED, STATE_UNKNOWN):
+                                print("STOP: FUSECTRL 不是 IDLE（%s）—— 本次不再读 BAR0、"
+                                      "不再开火。先重启判决机（POST 拉 PERST#），"
+                                      "仍不可达再断电 ≥30 s" % state,
+                                      file=sys.stderr, flush=True)
+                                poisoned_stop = True
+                                break
                             if bar.rd32(0x00) != 0xFFFFFFFF:
                                 v = classify(bar)
                                 outcome = _classify_attempt(v)
@@ -186,6 +224,10 @@ def cmd_campaign(args) -> int:
         "v_dip": v_dip,
         "attempts": tries,
         "valid": valid,
+        # Whether the loop ended because the controller tripped. Callers must not read
+        # this as "out of attempts" and retry: the card needs a reboot (or a power cycle)
+        # first, and every BAR0 read in between risks the machine-level hang from logs/02.
+        "poisoned_stop": poisoned_stop,
         "lost": lost,
         "nack": nack,
         "dsov_zero": dsov0,

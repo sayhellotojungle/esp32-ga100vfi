@@ -1,0 +1,27 @@
+key                      chain/bit before   after      status    
+fbio_disable             c1 b83+24  0xc0330c   0xc03000   CHANGED
+fbpa_disable             c1 b107+24 0xc0330c   0xc03000   CHANGED
+gpc_disable              c1 b131+8  0x15       0x0        CHANGED
+tpc_gpc0_disable         c1 b187+8  0xff       0x0        CHANGED
+tpc_gpc1_disable         c1 b195+8  0x1        0x0        CHANGED
+tpc_gpc2_disable         c1 b203+8  0xff       0x2        CHANGED
+tpc_gpc3_disable         c1 b211+8  0x1        0x0        CHANGED
+tpc_gpc4_disable         c1 b219+8  0xff       0x1        CHANGED
+tpc_gpc5_disable         c1 b227+8  0x0        0x0        same
+tpc_gpc6_disable         c1 b235+8  0x1        0x0        CHANGED
+tpc_gpc7_disable         c1 b243+8  0x0        0x0        same
+pes_disable              c1 b251+24 0x71c7     0x0        CHANGED
+fbp_disable              c1 b307+12 0x852      0x840      CHANGED
+rop_l2_disable           c1 b319+24 0xc0330c   0xc03000   CHANGED
+nvlink_disable           c1 b368+3  0x7        0x0        CHANGED
+sys_pipe_disable         c1 b372+8  0xfe       0x0        CHANGED
+pcie_devida              c2 b593+16 0x20c2     0x20c2     same
+pcie_devidb              c2 b609+16 0x20c2     0x20c2     same
+disable_gen3_speed_bit1  c2 b625+1  0x1        0x0        CHANGED
+disable_gen3_speed_bit9  c2 b633+1  0x1        0x0        CHANGED
+pcie_magic_gen4_dis      c2 b755+1  0x1        0x0        CHANGED
+pcie_boot_gen23_dis      c2 b790+1  0x1        0x0        CHANGED
+pcie_boot_gen3_dis       c2 b791+1  0x1        0x0        CHANGED
+magic_d                  c2 b730+32 0x16680000 0x14680000 CHANGED
+WARN: 16 of 190 free FF rows consumed; 174 left for corrections
+SIMULATION OK

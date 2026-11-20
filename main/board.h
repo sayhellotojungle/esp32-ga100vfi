@@ -26,11 +26,17 @@
 // station network is configured (http://192.168.4.1/).
 #define GA_AP_SSID "GA100VFI"
 #define GA_AP_PASS "ga100glitch"
+/* 版本号只在这里定义一次；横幅与 /api/status 都取这两个宏。
+ * 编译时刻单独成串，是为了能区分同版本号的不同构建。 */
+#define GA_FW_VERSION "0.3.0"
+#define GA_BUILD_STAMP __DATE__ " " __TIME__
+#define GA_BUILD GA_FW_VERSION " (" GA_BUILD_STAMP ")"
 
 // I2C (PMBus) to the NVVDD controller MP2888B @ 0x25. Any GPIO works via the
 // matrix; card-side 3V3 SMBus pull-ups, 3.3 V pads, direct connection.
-// GPIO6/7 are low, generally free GPIOs that are not strapping/USB/flash/PSRAM
-// pins and, unlike 48, are not the common onboard WS2812 status-LED pin.
+// Wired to GPIO47/48 on this bench. 6/7 would be the safer default (never the
+// onboard WS2812 pin), so if the bus reads no-ack here, check the wiring before
+// doubting the code; nothing else in the firmware claims 47 or 48.
 #define PIN_I2C_SDA  6
 #define PIN_I2C_SCL  7
 

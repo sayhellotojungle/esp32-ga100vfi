@@ -167,22 +167,79 @@ static void profile_cmd(bool fast)
     printf("%s %s\n", out, ok ? "OK" : "ERR");
 }
 
-static bool ensure_unlocked(void)
+/* Unlock the PMBus write protect, and do it in the order the part actually requires.
+ *
+ * CLEAR_FAULTS (0x03) goes in *before* the password. Our own glitch drives an
+ * over/under-voltage event; while that fault is latched the controller answers reads and
+ * refuses PW. The command that clears the fault is GA_CLR, GA_CLR lives in the timeline,
+ * and the timeline is gated behind this function -- so the password-first order deadlocks
+ * with no exit. Measured 2026-11-19/20 with exactly that order: `u` answered
+ * "unlock ERR" forever, every shot returned here before GA_RST_LOW, and twenty attempts
+ * bought twenty "under" verdicts from a card that had never been touched. The bench
+ * conclusion at the time was "the VRM latches solid, only removing VDD33 recovers it",
+ * which was wrong: 0x03 followed by the password unlocks it in one try, no power cycle.
+ *
+ * 0x03 is a plain command, not a protected write, so the write protect does not gate it;
+ * only 0x13/0x1F/0x21/0xE1 are. It is sent unconditionally rather than behind a decoded
+ * fault bit because which STATUS_CML bits mean "fault latched" on this part is not
+ * documented, and one extra byte write costs microseconds while a wrong guess costs
+ * another day of no-op shots.
+ *
+ * config-id 0x1229 (register 0x46) is part of unlocking, not a "fast profile" tweak.
+ * Reference implementation pwmvid.c:215-225 writes it in `u` and its README is explicit
+ * about why: it stops the GA100's devinit from re-locking the VRM. Our per-shot path used
+ * to make every write except this one, so the first glitch released PEX_RST, the GPU ran
+ * devinit, the VRM locked again, and attempts 2..12 all died here ("locked/unreachable",
+ * 11 nacks) even though the driver had never been loaded. Measured 2026-11-20. The write
+ * is verified by readback because the part ACKs protected writes it then discards. */
+enum { UNLOCK_OK = 0, UNLOCK_BUS, UNLOCK_REFUSED, UNLOCK_CONFIGID };
+
+static int ensure_unlocked(void)
 {
     uint8_t cml;
-    if (!pmbus_r(0x7E, &cml, 1)) return false;
+    if (!pmbus_r(0x7E, &cml, 1)) return UNLOCK_BUS;
     if (!(cml & 0x08)) {
+        pmbus_w(0x03, NULL, 0);                              // clear the fault, then ask
+        if (!pmbus_r(0x7E, &cml, 1)) return UNLOCK_BUS;
         const uint8_t pw[2] = {0x25,0x7C};
-        if (!pmbus_w(0xF2, pw, 2) || !pmbus_r(0x7E, &cml, 1) || !(cml & 0x08)) return false;
+        if (!pmbus_w(0xF2, pw, 2) || !pmbus_r(0x7E, &cml, 1) || !(cml & 0x08)) return UNLOCK_REFUSED;
     }
     const uint8_t wp = 0;
-    return pmbus_w(0x13, &wp, 1);
+    if (!pmbus_w(0x13, &wp, 1)) return UNLOCK_BUS;
+    if (!pmbus_w16(0x46, 0x1229)) return UNLOCK_CONFIGID;
+    uint8_t cfg[2];
+    if (!pmbus_r(0x46, cfg, 2) || cfg[0] != 0x29 || cfg[1] != 0x12) return UNLOCK_CONFIGID;
+    return UNLOCK_OK;
 }
 static void unlock_cmd(void)
 {
-    bool ok = ensure_unlocked();
-    if (ok) ok = pmbus_w16(0x46, 0x1229);
-    printf(ok ? "unlock MATCH\n" : "unlock ERR\n");
+    /* One line per failure mode, deliberately. This printed the same "unlock ERR" for a
+     * dead bus, a refused password and a refused follow-up write, and that ambiguity is
+     * what turned an ordinary ordering bug into a wrong hardware conclusion ("the VRM is
+     * latched, remove VDD33") and cost a day of no-op shots. "check your wiring", "the
+     * part said no" and "the password took but something else nacked" call for three
+     * different actions, so they have to be three different lines. */
+    uint8_t cml = 0;
+    if (!pmbus_r(0x7E, &cml, 1))
+    {
+        printf("unlock ERR unreachable (VRM 不应答：查供电/接线/地址/总线占用)\n");
+        return;
+    }
+    const int ul = ensure_unlocked();
+    switch (ul)
+    {
+    case UNLOCK_OK: break;
+    case UNLOCK_BUS:
+        printf("unlock ERR unreachable（总线/供电：读 CML 或写普通命令失败）\n");
+        return;
+    case UNLOCK_REFUSED:
+        printf("unlock ERR refused（CLEAR_FAULTS 后密码仍不匹配：pwd=0 真拒，需冷启）\n");
+        return;
+    default:
+        printf("unlock ERR config-id（密码已过，但 0x46=0x1229 写不进/回读不符 → VRM 被 devinit 锁死，需冷启）\n");
+        return;
+    }
+    printf("unlock MATCH\n");
 }
 static void lock_status_cmd(void)
 {
@@ -289,7 +346,13 @@ static bool board_execute_glitch(const glitch_args_t *input, int *writes_failed,
     int ns = glitch_build(&args, s_plan, GLITCH_MAX_STEPS, &post);
     (void)post;
     if (ns <= 0) { printf("glitch ERR invalid or oversized timeline\n"); goto finish; }
-    if (!ensure_unlocked()) { printf("glitch ERR controller locked/unreachable\n"); goto finish; }
+    const int ul = ensure_unlocked();
+    if (ul != UNLOCK_OK) {
+        printf("glitch ERR controller %s (ul=%d)\n",
+               ul == UNLOCK_REFUSED ? "password-refused"
+               : ul == UNLOCK_CONFIGID ? "config-id-0x1229-refused" : "unreachable", ul);
+        goto finish;
+    }
     if (args.fast && !profile_apply(true)) {
         printf("glitch ERR fast profile write failed\n"); (void)restore_locked(); goto finish;
     }
@@ -423,7 +486,7 @@ static void executor_task(void *arg)
     (void)arg;
     wdt_start();
     vTaskDelay(pdMS_TO_TICKS(1500));
-    printf("\nesp32-ga100vfi 0.2.0: core1 executor, I2C %d/%d PEX_RST OD@%d bus=%lu Hz reset=software\n",
+    printf("\nesp32-ga100vfi " GA_FW_VERSION ": core1 executor, I2C %d/%d PEX_RST OD@%d bus=%lu Hz reset=software\n",
            PIN_I2C_SDA,PIN_I2C_SCL,PIN_PEX_RST,(unsigned long)pmbus_baud_hz());
     printf("last reset: %s\n",reset_note);
     printf("commands: v u z g<args> w k K r j J b; @F @s @r @w @q @L @U @x; @W @O @P @C start|stop|status\n");

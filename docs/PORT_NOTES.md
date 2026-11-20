@@ -1,6 +1,6 @@
-# 0.2.0 架构与协议说明
+# 架构与协议说明（0.3.0）
 
-本页描述当前源码行为。它不包含目标固件编译或实板认证声明。引脚由 [board.h](../main/board.h) 定义，构建入口见 [BUILD.md](BUILD.md)。
+本文描述当前源码行为。引脚由 [board.h](../main/board.h) 定义，构建入口见 [BUILD.md](BUILD.md)。
 
 ## 硬件操作所有权
 
@@ -24,6 +24,14 @@ OTA、网页 Wi-Fi 凭据写入和硬件执行共用维护锁。后台日志及�
 ## 串口兼容
 
 原有单字符命令保留：`v u z w k K r j J b`。`g ...` 和 `@...` 是以 CR 或 LF 结束的行命令。主机客户端现在等待完整结束行，不会仅收到 `glitch done` 前缀就停止接收。
+
+## 解锁序列与版本自证
+
+`ensure_unlocked()` 的固定顺序：`CLEAR_FAULTS(0x03)` → 密码 `0xF2 0x7C 0x25` → `0x13=0` → `0x46=0x1229` → 回读 `0x46` 必须等于 `29 12`。先清故障是必需的：故障闩锁时控制器应答读、拒绝密码，而唯一能清故障的 `GA_CLR` 排在被密码门挡住的时间线内。`0x46=0x1229` 阻止 devinit 重新锁上 VRM，缺少它时第 1 发之后的每一发都在解锁门口返回。写不进 `0x46` 即返回 `config-id-0x1229-refused`。
+
+`unlock_cmd()` 的失败分三类输出：`unreachable`、`password-refused`、`PARTIAL pwd=1 0x46-failed`。
+
+版本号定义在 `main/board.h` 的 `GA_FW_VERSION`，启动横幅与 `/api/status` 的 `net.build` 共用；`GA_BUILD_STAMP` 为编译时刻，用于区分同版本号的不同构建。
 
 常用状态与管理命令：
 
