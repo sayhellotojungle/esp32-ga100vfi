@@ -2,9 +2,7 @@
 
 ESP32-S3 电压毛刺器，用于 NVIDIA GA100 CMP 170HX（`10de:20c2`）的 FF 熔丝解锁。流程固定为四步：毛刺进入 Goldilocks 状态（`DSOV=0` 且 `CRC_STATUS=0x55`）→ 生成 FF 烧写计划 → 交叉验证 → 追加 FF 记录 → 冷启重放。
 
-0.4.0 的接线默认值为 **SDA=GPIO6 / SCL=GPIO7**（0.3.x 本台架接的是 47/48，升级后需按 §4 重接）。熔丝烧写进展见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)：第二张 `10de:20c2` 已按 §1.6 规程烧入 11 条记录（行 301–311）并冷启动复核通过。
-
-本仓库开发卡实测结果：烧入 16 条记录（行 297–312），冷启后 `80 GiB FB / 124 SM / usable_fbp=10`，重扫剩余计划 0 条。
+0.4.0 的接线默认值为 **SDA=GPIO6 / SCL=GPIO7** **PEX_RST=GPIO10**,也可以自行配置修改，但是切记PEX_RST这个**只能下拉与悬空，千万不能拉高**。
 
 派生自 [dalzyu/pico-ga100vfi](https://github.com/dalzyu/pico-ga100vfi)（RP2350/Pico 实现）：毛刺原理与时序打法承袭上游；固件移植到 ESP32-S3（ESP-IDF / Arduino-ESP32）；主机端工具、HTTP 协议与熔丝烧写规程在本仓库重写。
 
@@ -12,7 +10,7 @@ ESP32-S3 电压毛刺器，用于 NVIDIA GA100 CMP 170HX（`10de:20c2`）的 FF 
 |---|---|---|
 | **ffcalc**（同作者独立仓库） | FF 链分析、烧写计划生成、`verify`/`sim` 交叉验证 | 不可。计划与验证以它为准 |
 | `host/ga100vfi`（本仓库） | 判决链、512 行采集、第二套独立对账、烧写执行 | 不可（本仓库工具与 ffcalc 互为独立实现） |
-| [cmpunlocker](https://github.com/amoghmunikote/cmpunlocker) | 阶段二/三：驱动层几何显现与 Gen4 重训 | 熔丝之外，与本仓库无关 |
+| [cmpunlocker](https://github.com/sayhellotojungle/cmpunlocker) | 阶段二/三：驱动层几何显现与 Gen4 重训 | 熔丝之外，与本仓库无关 |
 
 参考：[kate 的毛刺解锁长文](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/)。
 
@@ -292,7 +290,7 @@ BAR0 偏移，全部实机确认：
 
 引脚定义集中在 [main/board.h](main/board.h)，改引脚只改这三行。内含编译期检查：0/3/45/46（strapping）、19/20（原生 USB）、26–32（SPI flash）、33–37（octal flash/PSRAM，需 `GA_ALLOW_OCTAL_PINS` 显式放行）一律拒绝；三个角色不得共用一个引脚。若按上表接线后总线读不到 ACK，先查接触与上拉，再怀疑代码：固件不占用其他引脚。
 
-ESP32-S3 不挑板子：任意 ESP32-S3 开发板按上表接线、刷入固件即可。本仓库开发卡的毛刺板为早前 openUPS 项目遗留模组，非必需规格。SDA/SCL 接插件必须压实：总线"全死"最常见的原因是接触不良。
+**ESP32-S3 不挑板子：任意 ESP32-S3 开发板按上表接线、刷入固件即可。本仓库开发卡的毛刺板为早前 openUPS 项目遗留模组，非必需规格。SDA/SCL 接插件必须压实：总线"全死"最常见的原因是接触不良。**
 
 两条硬件不变量：
 
@@ -305,7 +303,7 @@ GND：显卡与毛刺板之间直接接一根 GND 线。经主板/供电共地�
 
 ![焊接点位标注](docs/images/wiring-points.png)
 
-![焊接点位原图](docs/images/wiring-points-closeup.png)
+
 
 ![接线后全图](docs/images/wiring-overview.png)
 
