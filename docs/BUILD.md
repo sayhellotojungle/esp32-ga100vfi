@@ -1,6 +1,6 @@
 # 构建与运行
 
-本文给出可复现的构建入口。`firmware/` 附带 arduino-cli（Arduino-ESP32 3.3.11，`FlashSize=16M,PSRAM=opi`）交叉编译的 0.3.0 镜像；构建与验证范围见 [TEST_RESULTS.md](TEST_RESULTS.md)。
+本文给出可复现的构建入口。`firmware/` 附带 arduino-cli（Arduino-ESP32 3.3.11，`FlashSize=16M,PSRAM=opi`）交叉编译的 0.3.1 镜像；构建与验证范围见 [TEST_RESULTS.md](TEST_RESULTS.md)。
 
 所有命令默认在项目根目录执行。
 

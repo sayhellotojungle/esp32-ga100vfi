@@ -19,7 +19,19 @@
 #if defined(CONFIG_GA_I2C_BAUD_HZ)
 #define GA_BAUD_HZ CONFIG_GA_I2C_BAUD_HZ
 #else
-#define GA_BAUD_HZ 400000
+#define GA_BAUD_HZ 1000000
+#endif
+
+/* Hard ceiling on how long PEX_RST may sit low, enforced in firmware.
+ *
+ * 'j'/'J' is an unbounded manual hold, and the reset that each shot's timeline
+ * performs is only ~1 ms, so anything approaching this number is a forgotten 'j'
+ * -- not a plan. Measured consequence on 2026-11-21: a 10 s manual hold left the
+ * card unreachable and the box needing a power cycle. The guard task in main.c
+ * releases the pad itself once this much time passes and prints why, so "never
+ * hold reset for long" is a property of the build, not of who typed the command. */
+#ifndef GA_PEX_MAX_HOLD_MS
+#define GA_PEX_MAX_HOLD_MS 3000
 #endif
 
 // SoftAP fallback: always up, so the board is reachable even before any
@@ -27,16 +39,29 @@
 #define GA_AP_SSID "GA100VFI"
 #define GA_AP_PASS "ga100glitch"
 /* 版本号只在这里定义一次；横幅与 /api/status 都取这两个宏。
- * 编译时刻单独成串，是为了能区分同版本号的不同构建。 */
-#define GA_FW_VERSION "0.3.0"
+ * 编译时刻单独成串，是为了能区分同版本号的不同构建。
+ * 0.3.2: 每步实际执行时刻 + 时长打进日志（dip 的尾沿和被 1 MHz 阻塞写拖走的释放沿，
+ * 是今天 0/60 发不命中的真正原因），并且 PEX_RST 手动保持超过
+ * GA_PEX_MAX_HOLD_MS 会被固件自己放开（忘记的 'j' 和卡死了长得一模一样）。
+ * 0.4.0: I²C 引脚改为 GPIO6/7（见下面的接线说明）。波形、时序、遥测字段与 0.3.2 完全
+ * 一致，因此 0.3.2 攒下的战绩与标定对本版仍然有效；本版号升 minor 只因为**接线变了**——
+ * 拿旧版说明书接线的人会在总线上拿到 NACK，这件事必须从版本号上就能看出来。 */
+#define GA_FW_VERSION "0.4.0"
 #define GA_BUILD_STAMP __DATE__ " " __TIME__
 #define GA_BUILD GA_FW_VERSION " (" GA_BUILD_STAMP ")"
 
 // I2C (PMBus) to the NVVDD controller MP2888B @ 0x25. Any GPIO works via the
 // matrix; card-side 3V3 SMBus pull-ups, 3.3 V pads, direct connection.
-// Wired to GPIO47/48 on this bench. 6/7 would be the safer default (never the
-// onboard WS2812 pin), so if the bus reads no-ack here, check the wiring before
-// doubting the code; nothing else in the firmware claims 47 or 48.
+// GPIO6/7: neither is a strapping pin (0/3/45/46), neither is USB D-/D+ (19/20),
+// neither is on the flash bus (26..32) or the octal-PSRAM bus (33..37), and neither
+// drives an onboard peripheral. The previous bench wiring was GPIO47/48, which works
+// but sits on the same pad as the module's onboard WS2812 -- a strip of LED data
+// traffic there looks to the PMBus exactly like a stuck slave. The compile-time
+// checks below are what make "pick any free GPIO" a rule instead of a hope.
+// Re-wiring changes the bus, not just the pin number: the 1 MHz timing baseline is
+// re-probed at every bring-up (see CHANGELOG 0.3.1), and a bus that cannot answer at
+// 1 MHz degrades with a printed reason -- check the banner says 1000000 Hz before
+// trusting any shot geometry, because every dip width in the archive is 1 MHz math.
 #define PIN_I2C_SDA  6
 #define PIN_I2C_SCL  7
 

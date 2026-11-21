@@ -1,9 +1,13 @@
 // PMBus / I2C bridge for the MP2888B @ 0x25.
 //
 // IDF v5 i2c_master (DMA) driver; bus speed runtime-switchable (@F), default
-// from Kconfig (400 kHz: the card's SMBus pull-ups are Fm-spec, Fm+ rise
-// times are not guaranteed). Pull-up verification and the unpowered-card
-// ESD-clamp discriminator follow detect.c.
+// from Kconfig (1 MHz: the reference rig's timing baseline — a 16-bit PMBus
+// write is 36 us instead of 90 us at 400 kHz, and `delay` in the reference
+// recipe is calibrated against that). The card's SMBus pull-ups are only
+// specified for 400 kHz, so every bring-up *proves* the rate with a read-only
+// probe and steps down 1 MHz -> 400 kHz -> 100 kHz if the bus will not take it.
+// Pull-up verification and the unpowered-card ESD-clamp discriminator follow
+// detect.c.
 #include "pmbus.h"
 
 #include <stdio.h>
@@ -22,6 +26,7 @@
 #include "driver/i2c_master.h"
 #include "esp_attr.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "soc/gpio_reg.h"
 #include "soc/soc.h"
 
@@ -36,6 +41,15 @@ static uint32_t s_baud = GA_BAUD_HZ;
 static uint32_t s_effective_baud = GA_BAUD_HZ;
 static bool s_up;
 static bool s_scl_held;
+
+// Fastest first; a failed bring-up probe falls through to the next entry.
+static const uint32_t k_baud_ladder[] = { 1000000u, 400000u, 100000u };
+#define BAUD_LADDER_N (sizeof k_baud_ladder / sizeof k_baud_ladder[0])
+// Fastest rate that ever probed OK this boot (0 = not constrained yet). Kept
+// across pmbus_down() so a downgraded bus is not re-probed -- and re-NACKed --
+// on every bring-up; `@F` re-arms it with an explicit request.
+static uint32_t s_ceiling;
+static bool s_downgrade_reported;
 
 uint32_t pmbus_baud_hz(void) { return s_effective_baud; }
 uint32_t pmbus_requested_baud_hz(void) { return s_baud; }
@@ -65,6 +79,55 @@ static bool external_pullup(int pin)
 }
 
 // ------------------------------------------------------------------- bus
+static void bus_teardown(void)
+{
+    if (s_dev) { i2c_master_bus_rm_device(s_dev); s_dev = NULL; }
+    if (s_bus) { i2c_del_master_bus(s_bus); s_bus = NULL; }
+}
+
+static bool bus_open(uint32_t hz, bool use_pulls)
+{
+    i2c_master_bus_config_t bcfg = {
+        .i2c_port = I2C_PORT,
+        .sda_io_num = PIN_I2C_SDA,
+        .scl_io_num = PIN_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = use_pulls,
+    };
+    if (i2c_new_master_bus(&bcfg, &s_bus) != ESP_OK) {
+        s_bus = NULL;
+        return false;
+    }
+    i2c_device_config_t dcfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = PMBUS_ADDR,
+        .scl_speed_hz = hz,
+        .scl_wait_us = 10000,          // tolerate clock stretching
+    };
+    if (i2c_master_bus_add_device(s_bus, &dcfg, &s_dev) != ESP_OK) {
+        bus_teardown();
+        return false;
+    }
+    return true;
+}
+
+// Read-only liveness probe. STATUS_CML (0x7E) is a plain read with no side
+// effects (CLEAR_FAULTS is 0x03), so it is safe before any command, and three
+// consecutive ACKs mean the bus sustains this rate rather than one lucky
+// transaction. A rate that cannot be proven is worse than a slow one: the
+// timeline's pulse widths are floored at pmbus_write_us(), so a silent
+// downgrade after the plan is built would stretch every dip edge.
+static bool bus_probe(void)
+{
+    for (int i = 0; i < 3; i++) {
+        uint8_t reg = 0x7E, v = 0;
+        if (i2c_master_transmit_receive(s_dev, &reg, 1, &v, 1, I2C_TO_MS) != ESP_OK)
+            return false;
+    }
+    return true;
+}
+
 bool pmbus_up(void)
 {
     if (s_scl_held) return false;
@@ -76,7 +139,6 @@ bool pmbus_up(void)
     bool ext_sda = external_pullup(PIN_I2C_SDA);
     bool ext_scl = external_pullup(PIN_I2C_SCL);
     bool use_pulls = !(ext_sda && ext_scl);
-    uint32_t eff_baud = s_baud;
 
     if (use_pulls) {
         printf("no external pull-up on%s%s: using ~45k internal pull-ups\n",
@@ -92,51 +154,42 @@ bool pmbus_up(void)
             pin_input_no_pull(PIN_I2C_SCL);
             return false;
         }
-        if (eff_baud > 100000) eff_baud = 100000;   // slow edges on 45k pulls
     }
 
-    i2c_master_bus_config_t bcfg = {
-        .i2c_port = I2C_PORT,
-        .sda_io_num = PIN_I2C_SDA,
-        .scl_io_num = PIN_I2C_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = use_pulls,
-    };
-    if (i2c_new_master_bus(&bcfg, &s_bus) != ESP_OK) {
-        printf("I2C ERR bus init\n");
-        pin_input_no_pull(PIN_I2C_SDA);
-        pin_input_no_pull(PIN_I2C_SCL);
-        return false;
+    // Ceiling: 100 kHz on slow 45k pull-ups, and never above the fastest rate
+    // that already proved itself this boot.
+    uint32_t want = s_baud;
+    if (use_pulls && want > 100000u) want = 100000u;
+    if (s_ceiling && want > s_ceiling) want = s_ceiling;
+
+    for (unsigned i = 0; i < BAUD_LADDER_N; i++) {
+        uint32_t hz = k_baud_ladder[i];
+        if (hz > want) continue;
+        if (!bus_open(hz, use_pulls)) { bus_teardown(); continue; }
+        if (bus_probe()) {
+            s_effective_baud = hz;
+            s_ceiling = hz;
+            s_up = true;
+            if (hz != s_baud && !s_downgrade_reported) {
+                s_downgrade_reported = true;
+                printf("I2C %lu Hz unusable, running at %lu Hz\n",
+                       (unsigned long)s_baud, (unsigned long)hz);
+            }
+            return true;
+        }
+        bus_teardown();
     }
-    i2c_device_config_t dcfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = PMBUS_ADDR,
-        .scl_speed_hz = eff_baud,
-        .scl_wait_us = 10000,          // tolerate clock stretching
-    };
-    if (i2c_master_bus_add_device(s_bus, &dcfg, &s_dev) != ESP_OK) {
-        printf("I2C ERR dev init\n");
-        i2c_del_master_bus(s_bus);
-        s_bus = NULL;
-        pin_input_no_pull(PIN_I2C_SDA);
-        pin_input_no_pull(PIN_I2C_SCL);
-        return false;
-    }
-    s_effective_baud = eff_baud;
-    s_up = true;
-    return true;
+    printf("I2C ERR no ack at any ladder rate (1 MHz/400 kHz/100 kHz) -- "
+           "check wiring, controller power, or a stuck SCL\n");
+    pin_input_no_pull(PIN_I2C_SDA);
+    pin_input_no_pull(PIN_I2C_SCL);
+    return false;
 }
 
 void pmbus_down(void)
 {
-    if (s_up) {
-        i2c_master_bus_rm_device(s_dev);
-        i2c_del_master_bus(s_bus);
-        s_dev = NULL;
-        s_bus = NULL;
-        s_up = false;
-    }
+    bus_teardown();
+    s_up = false;
     pin_input_no_pull(PIN_I2C_SDA);
     pin_input_no_pull(PIN_I2C_SCL);
     s_scl_held = false;
@@ -145,8 +198,10 @@ void pmbus_down(void)
 bool pmbus_set_baud(unsigned long hz)
 {
     if (hz != 100000 && hz != 400000 && hz != 1000000) return false;
-    s_baud = hz;
-    s_effective_baud = hz;
+    s_baud = (uint32_t)hz;
+    s_ceiling = (uint32_t)hz;      // an explicit request re-arms the ladder
+    s_downgrade_reported = false;
+    s_effective_baud = (uint32_t)hz;
     if (s_up) pmbus_down();
     return true;
 }
@@ -228,6 +283,14 @@ void pex_init(void)
 
 // Used from the hardware-timer ISR as well as the command task. Direct latch
 // writes stay IRAM-safe and preserve the pad's permanently open-drain mode.
+//
+// The stamp is what makes the manual-hold red line real code instead of prose: 'j'
+// holds PEX_RST with no upper bound, and on 2026-11-21 a 10 s manual hold was followed
+// by a machine that needed a power cycle. pex_guard_task() below now force-releases any
+// hold longer than GA_PEX_MAX_HOLD_MS, so "we never hold reset longer than N seconds"
+// no longer depends on whoever typed the command.
+static volatile int64_t s_pex_low_since;
+
 void IRAM_ATTR pex_hold(bool low)
 {
 #if PIN_PEX_RST < 32
@@ -237,6 +300,14 @@ void IRAM_ATTR pex_hold(bool low)
     if (low) REG_WRITE(GPIO_OUT1_W1TC_REG, 1u << (PIN_PEX_RST - 32));
     else REG_WRITE(GPIO_OUT1_W1TS_REG, 1u << (PIN_PEX_RST - 32));
 #endif
+    s_pex_low_since = low ? esp_timer_get_time() : 0;
+}
+
+// How long PEX_RST has been held low right now (0 while released).
+int64_t pex_held_us(void)
+{
+    int64_t t0 = s_pex_low_since;
+    return t0 ? esp_timer_get_time() - t0 : 0;
 }
 
 void pmbus_scl_hold(bool low)
@@ -372,9 +443,15 @@ void pmbus_cmd(char *line)
         char *end;
         errno = 0;
         unsigned long hz = strtoul(line + 1, &end, 10);
-        if (end != line + 1 && !errno && !*skip_space(end) && pmbus_set_baud(hz))
-            printf("I2C baud %lu\n", hz);
-        else printf("I2C ERR baud\n");
+        if (end != line + 1 && !errno && !*skip_space(end) && pmbus_set_baud(hz)) {
+            // Report what the bus actually took, not what was asked for: the
+            // rate is proven by a read-only probe during bring-up.
+            if (!pmbus_up()) printf("I2C baud %lu: no ack\n", hz);
+            else if (pmbus_baud_hz() != hz)
+                printf("I2C baud %lu unusable, running at %lu Hz\n",
+                       hz, (unsigned long)pmbus_baud_hz());
+            else printf("I2C baud %lu\n", hz);
+        } else printf("I2C ERR baud\n");
         return;
     }
     if (op == 'x') { bb_scan(); return; }

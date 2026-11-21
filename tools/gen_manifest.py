@@ -29,9 +29,11 @@ def tracked_files():
 
 def normalized_bytes(path):
     """Apply git's text filters through the object store, then read the blob back."""
+    # encoding is explicit: on a Chinese-locale Windows the default is GBK, and git's
+    # CRLF warnings quote a UTF-8 file name -- the reader thread dies on the bytes.
     sha1 = subprocess.run(["git", "hash-object", "-w", "--path", path, "--", path],
                           cwd=ROOT, check=True, capture_output=True,
-                          text=True).stdout.strip()
+                          text=True, encoding="utf-8", errors="replace").stdout.strip()
     return subprocess.run(["git", "cat-file", "blob", sha1], cwd=ROOT, check=True,
                           capture_output=True).stdout
 

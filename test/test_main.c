@@ -12,6 +12,10 @@ static int checks,failures;
 struct mock_mutex {int available;};
 static struct mock_mutex locks[32];
 static int nlocks,write_calls,fail_reg=-1,fail_read_reg=-1,task_core,task_priority;
+/* Task creation is recorded per task name: the executor must stay core-pinned at its
+ * priority, while the PEX hold guard is deliberately unpinned and lower. A single shared
+ * "last task" variable would make adding any second task look like a regression. */
+static int exec_core=-1,exec_priority=-1,guard_priority=-1,guard_pinned=-1;
 static bool reset_low,bus_held,network_called;
 static int64_t clock_us;
 static esp_reset_reason_t reset_reason=ESP_RST_POWERON;
@@ -23,7 +27,11 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t m,TickType_t t){(void)t;if(!m->avail
 BaseType_t xSemaphoreGive(SemaphoreHandle_t m){assert(!m->available);m->available=1;return 1;}
 void vTaskDelay(TickType_t t){clock_us+=(int64_t)t*1000;}
 BaseType_t xTaskCreatePinnedToCore(void(*f)(void*),const char*n,uint32_t stack,void*a,UBaseType_t p,void*h,BaseType_t c)
-{(void)f;(void)n;(void)stack;(void)a;(void)h;task_core=c;task_priority=(int)p;return pdPASS;}
+{(void)f;(void)stack;(void)a;(void)h;task_core=c;task_priority=(int)p;
+ if(n&&strcmp(n,"ga_executor")==0){exec_core=c;exec_priority=(int)p;}return pdPASS;}
+BaseType_t xTaskCreate(void(*f)(void*),const char*n,uint32_t stack,void*a,UBaseType_t p,void*h)
+{(void)f;(void)stack;(void)a;(void)h;task_priority=(int)p;
+ if(n&&strcmp(n,"ga_pex_guard")==0){guard_priority=(int)p;guard_pinned=0;}return pdPASS;}
 int64_t esp_timer_get_time(void){clock_us+=10;return clock_us;}
 esp_err_t esp_timer_create(const esp_timer_create_args_t*c,esp_timer_handle_t*h){(void)c;*h=(void*)1;return ESP_OK;}
 esp_err_t esp_timer_start_periodic(esp_timer_handle_t h,uint64_t n){(void)h;(void)n;return ESP_OK;}
@@ -39,6 +47,10 @@ void net_init(void){network_called=true;}
 void net_wifi_cmd(const char*s){(void)s;}
 void pex_init(void){reset_low=false;}
 void pex_hold(bool low){reset_low=low;}
+/* The guard's only input. Modelled from the pad state plus a clock the test winds: a
+ * held pad that never comes back is precisely the forgotten-'j' failure. */
+static int64_t pex_held_override_us;
+int64_t pex_held_us(void){ return reset_low ? pex_held_override_us : 0; }
 bool pmbus_up(void){return !bus_held;}
 void pmbus_scl_hold(bool low){bus_held=low;}
 uint32_t pmbus_baud_hz(void){return actual_baud;}
@@ -87,7 +99,24 @@ void pmbus_cmd(char*s){snprintf(last_bus_command,sizeof last_bus_command,"%s",s)
 static void command(const char*s){char b[GA_COMMAND_MAX];snprintf(b,sizeof b,"%s",s);dispatch(b);}
 int main(void)
 {
-    ga_app_main();CHECK(task_core==1 && task_priority==8);CHECK(!board_is_busy());CHECK(!network_called);
+    ga_app_main();CHECK(exec_core==1 && exec_priority==8);
+    /* The PEX hold guard must exist, be created, and sit below the executor: it exists so
+     * a forgotten 'j' cannot leave the card in reset (see GA_PEX_MAX_HOLD_MS). */
+    CHECK(guard_pinned==0 && guard_priority>=0 && guard_priority<exec_priority);
+    CHECK(!board_is_busy());CHECK(!network_called);
+    /* A forgotten 'j' must not be able to hold reset forever: on 2026-11-21 a 10 s manual
+     * hold left the card unreachable and the box needed a power cycle, and nothing but a
+     * person's memory distinguished that from a dead card. Drive it through the real
+     * command path, then the guard, so the ceiling itself (not just the constant) is
+     * what the build is testing. */
+    command("j"); CHECK(reset_low);
+    pex_held_override_us = (int64_t)GA_PEX_MAX_HOLD_MS * 1000 + 1;
+    CHECK(pex_guard_once()); CHECK(!reset_low);
+    command("j"); CHECK(reset_low);
+    pex_held_override_us = 1000;                     /* plan-sized hold: must be left alone */
+    CHECK(!pex_guard_once()); CHECK(reset_low);
+    command("J"); CHECK(!reset_low);
+    pex_held_override_us = 0;
     command("@F1000000");CHECK(!strcmp(last_bus_command,"F1000000"));
     command("@F400000");CHECK(!strcmp(last_bus_command,"F400000"));
     CHECK(board_begin_maintenance());CHECK(board_is_busy());CHECK(!board_begin_maintenance());

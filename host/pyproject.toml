@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ga100vfi"
-version = "0.3.0"
+version = "0.4.0"
 description = "ESP32-S3 I2C voltage fault injection host client for GA100 (pico-protocol compatible)"
 requires-python = ">=3.10"
 dependencies = ["pyserial>=3.5"]

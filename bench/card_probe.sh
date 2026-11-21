@@ -20,7 +20,31 @@ for bdf in $CARD_CANDIDATES; do
   fi
 done
 
-echo "== 3. 上游桥还在吗（卡不在时桥通常仍在，能区分「槽没了」与「设备没了」）=="
+echo "== 3. 配置空间到底答不答（`lspci` 那张表是枚举缓存，不答也能列着）=="
+# 2026-11-21 的误判形状：卡烧成功之后冷启动，`lspci` 列着设备、BAR0 整片 `0xffffffff`，
+# 差一步判成"卡死了"。真因是 Command 的 Memory Space Enable 从没被置起来（没有驱动 claim
+# 这张卡）。所以先看 VID/DID 的原始字，再看 Command bit1，最后才轮到 BAR0。
+BDF=${BDF:-0000:01:00.0}
+VID=$(setpci -s $BDF 0.w 2>/dev/null); DID=$(setpci -s $BDF 2.w 2>/dev/null)
+CMD=$(setpci -s $BDF 4.w 2>/dev/null)
+printf '   %s  VID:DEV=%s:%s  Command=%s\n' "$BDF" "${VID:-无}" "${DID:-无}" "${CMD:-无}"
+case "${VID:-ffff}" in
+  ffff)
+    echo "   [!!] 配置空间不答 → 掉卡或没电。按下面「两种死法」分形状；retrain/rescan 实测 4/4 无效"
+    echo "        （板子拉 PERST# 能叫回来 = 那一发作废记 void；叫不回 = 断电，记 dead）"
+    ;;
+  *)
+    echo "   [ok] 配置空间在答：卡活着。"
+    if [ -n "${CMD:-}" ] && [ $((0x$CMD & 2)) -eq 0 ]; then
+      echo "   [!!] Command 的 bit1(Memory Space Enable)=0 → **BAR0 会整片读回 0xffffffff，这不是死**"
+      echo "        处置：cd \$HOME/ga100vfi/host && python3 -m ga100vfi.burn --bdf $BDF wake"
+    else
+      echo "   [ok] memory decode 已开：BAR0 可读（判 poison 仍要先看 device id，见 poison_check.sh）"
+    fi
+    ;;
+esac
+
+echo "== 4. 上游桥还在吗（卡不在时桥通常仍在，能区分「槽没了」与「设备没了」）=="
 for bridge in /sys/bus/pci/devices/0000:00:*/ ; do
   b=${bridge%/}; bdf=${b##*/}
   class=$(cat "$b/class" 2>/dev/null)
@@ -34,18 +58,19 @@ for bridge in /sys/bus/pci/devices/0000:00:*/ ; do
   esac
 done
 
-echo "== 4. dmesg 里最近的 PCIe / 显卡相关记录（只看，不解读）=="
+echo "== 5. dmesg 里最近的 PCIe / 显卡相关记录（只看，不解读）=="
 dmesg 2>/dev/null | grep -iE 'pci|aer|pcie|nvidia|10de|hub' | tail -25 | sed 's/^/   /'
 
-echo "== 5. 有没有残留的 nvidia 驱动绑着（必须为 0，驱动加载会关窗口）=="
-BDF=${BDF:-0000:01:00.0}
+echo "== 6. 有没有残留的 nvidia 驱动绑着（必须为 0，驱动加载会关窗口）=="
 cat /sys/bus/pci/devices/$BDF/driver 2>/dev/null >/dev/null \
   && echo "   [!!] 有驱动绑定" || echo "   [ok] 无驱动绑定"
 lsmod 2>/dev/null | grep -iE '^nvidia' | sed 's/^/   loaded: /'
 systemctl is-enabled nvidia-persistenced 2>/dev/null | sed 's/^/   persistenced: /'
 
-echo "== 6. rescan 之前先留档：内核看到的设备总数 =="
+echo "== 7. 内核看到的设备总数（rescan 前后各留一份档才有意义）=="
 echo "   $(find /sys/bus/pci/devices -maxdepth 1 -type l | wc -l) 个设备节点"
 echo
-echo "本脚本不做 rescan、不写配置空间。要不要 rescan 由人决定（下面的命令备用）："
+echo "本脚本不 rescan、不写配置空间（第 3 步只读）。rescan / 对桥发 Retrain 实测 4/4 叫不回卡，"
+echo "并且两次把整机带走：它已从开火路径上禁用，只在你确认要拿它排除桥侧故障时手工做。"
+echo "第 3 步那种 Command=0 的形状用 wake 就能解，不该动用 rescan："
 echo "   echo 1 > /sys/bus/pci/rescan"

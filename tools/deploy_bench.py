@@ -86,8 +86,16 @@ def tracked(prefix):
     return [f for f in out if "__pycache__" not in f and not f.endswith(".pyc")]
 
 
+# Not under host/ or bench/, but required by README §1.4 on the judging host: capture 路径
+# 出的快照没有 fingerprint，`ffcalc verify`（认卡闸门）会直接 FAIL，没有这个工具就补不了身份。
+EXTRA_FILES = ["tools/attach_identity.py"]
+
+
 def make_tar(path):
-    files = tracked("host") + tracked("bench")
+    files = tracked("host") + tracked("bench") + EXTRA_FILES
+    for f in EXTRA_FILES:
+        if not (REPO / f).exists():
+            sys.exit(f"{f} 不在仓库里：§1.4 的认卡闸门（ffcalc verify）在判决机上跑不起来")
     if not files:
         sys.exit("nothing to pack: is this a git checkout with host/ and bench/?")
     with tarfile.open(path, "w:gz") as tf:
@@ -177,9 +185,22 @@ grep -q 0xBADF0000 {prefix}/host/ga100vfi/classify.py || {{ echo "!! classify �
 # 第三种态（实测 0x00000000）比 poison 更早出现，判据缺了它等于没有：见 §七乙。
 grep -q STATE_UNKNOWN {prefix}/host/ga100vfi/classify.py || {{ echo "!! classify 里没有第三种态判据"; exit 7; }}
 grep -q 'delay=' {prefix}/host/ga100vfi_agent.py || {{ echo "!! 判决行不带坐标，跨轮台账会瞎"; exit 7; }}
+# BAR0 闸门（bar0.require_mapped）：映射之前必须先用只读证据确认"桥的链路层活着 + device
+# id 是健康的 20c2"。今天判决机整机死了四次，每一次都是把 MMIO 打向一块链路已经不存在的
+# 卡。05:01 那次尤其说明问题：我升了固件版本却忘了同步版本闸门的其他两处，部署在
+# check_versions() 就退出了，而我的开火命令是 PowerShell 链里 deploy 之后的下一条 ——
+# 它不会因为上一条失败就停下，于是我用一份**没有闸门的旧 bar0.py** 开了火。
+# 所以这条自检的意义是：闸门没部署上去 = 部署失败，而不是"少了一个可有可无的文件"。
+grep -q 'def require_mapped' {prefix}/host/ga100vfi/bar0.py || {{ echo "!! bar0.py 没有 require_mapped 闸门 —— 这台机器开 BAR0 之前不会先看链路层/device id，禁止这一版上线"; exit 7; }}
+grep -q 'Bar0Unavailable' {prefix}/host/ga100vfi_agent.py || {{ echo "!! agent 不认 Bar0Unavailable：闸门一拦就变异常，判决落不了盘"; exit 7; }}
 # 开火入口必须检查板上固件版本，否则这一轮日志无法回答"哪版固件打的"。
 grep -q 'EXPECT_FW=' {prefix}/bench/crack.sh || {{ echo "!! crack.sh 没有固件版本闸门"; exit 7; }}
-echo "   [ok] poison 防护、第三种态、带坐标判决都已部署"
+# §1.4 的认卡闸门：capture 快照没有 fingerprint，ffcalc verify 会 FAIL。缺这个工具，
+# 现场只剩两种坏选择——跳过 verify，或手搓一个哈希（输入集不同则与规范不可比）。
+test -f {prefix}/tools/attach_identity.py || {{ echo "!! 缺 tools/attach_identity.py：verify 闸门补不了身份"; exit 7; }}
+grep -q ingest.fingerprint {prefix}/tools/attach_identity.py || {{ echo "!! attach_identity 没调用 ffcalc 自己的指纹算法"; exit 7; }}
+grep -q 'len(rows) != 512' {prefix}/tools/attach_identity.py || {{ echo "!! attach_identity 不检查 512 行完整性"; exit 7; }}
+echo "   [ok] poison 防护、第三种态、带坐标判决、认卡工具都已部署"
 echo "== 自检：四态判据在机器上真跑一遍 =="
 cd {prefix}/host && python3 -c "
 from ga100vfi import classify as c

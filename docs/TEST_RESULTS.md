@@ -1,5 +1,42 @@
 # 测试记录
 
+## 0.4.0 — 2026-11-21
+
+| 范围 | 命令 | 结果 |
+|---|---|---|
+| Python 主机端 | `python -m unittest discover -s tests -p "test_*.py"`（Windows 开发机，Python 3.13） | **196 tests, 0 failed**（0.3.1 基线 172；新增续烧、快照差分、memory-enable、台架脚本形状四组） |
+| 台架脚本 | `bash tools/check_scripts.sh` | 13 个脚本 `bash -n` 通过，无 CRLF |
+| 版本一致性 | `tools/deploy_bench.py::check_versions()` | `main/board.h` / `bench/crack.sh` 的 `EXPECT_FW` / `host/pyproject.toml` 均为 `0.4.0` |
+| Arduino 镜像源 | `python tools/sync_arduino.py` | 19 个源同步，`GA_FW_VERSION "0.4.0"`、`PIN_I2C_SDA 6` / `PIN_I2C_SCL 7`；编译期引脚检查按新默认值通过 |
+| 固件构建 | `arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" --build-path build-arduino --warnings all arduino/ga100vfi`（arduino-cli 1.5.1 / Arduino-ESP32 3.3.11） | 通过，无警告新增；app **893,920 B**（程序空间 68%），全局变量 **72,304 B**（22%）；构建串 `0.4.0 (Nov 21 2026 16:03:02)` |
+| 发布门禁 | `python tools/package_firmware.py --prune` 后 `--check` | `OK: 0.4.0 images … match 41 firmware sources`；app sha256 `40272836e797c3ae…`、merged `4fd4f012f8db0a5f…`、源码摘要 `80ad27236a91685a…`；`git = {commit: 99c0df3, dirty: false}`（工作树干净，镜像可等同于该提交） |
+
+| 发布工件 | `python tools/gen_manifest.py` | 清单覆盖 firmware/ 镜像与全部台架脚本；`gen_manifest.py --check` 通过 |
+
+**待办**：
+
+| 范围 | 命令 | 状态 |
+|---|---|---|
+| C 回归 | `python test/run_tests.py`（需 gcc） | 未跑；本轮未改 C 侧，仅改 `main/board.h` 的引脚与版本宏。判决机上用 `python tools/pack_src_tests.py --run` 补 |
+| 板上自证 | `BOARD=http://… IMG=… EXPECT=40272836e797c3ae bash bench/ota.sh` | 待做。**前置条件**：先把 SMBus 线从 47/48 移到 6/7，否则刷上去的 0.4.0 读不到 VRM |
+| 速率自证 | 冷启后读 `/api/status` 的 `board.baud` | 待做，必须为 `1000000`；`crack.sh` 会把它当闸门（`EXPECT_BAUD`） |
+
+0.4.0 之前：`firmware/` 只保留当前版本的镜像，`--prune` 已移除 0.3.1 的 zip；0.3.1 与 0.3.2 的镜像与板上自证记录在本文件下方。
+
+## 0.3.1 — 2026-11-21
+
+| 范围 | 命令 | 结果 |
+|---|---|---|
+| Python 主机端 | `python3 test/run_tests.py`（WSL Ubuntu 22.04 内的同一套） | 82 tests, 0 failed |
+| C 回归（WSL Ubuntu，gcc 11.4.0） | `python3 test/run_tests.py` | **OFFLINE REGRESSIONS PASSED**；planner 335、protocol 300、campaign/oracle 2385、runtime 47、console 66、pmbus 52、pmbus_high_bank 52、http 17 场景，全部 0 failures |
+| 固件构建 | `arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" --build-path build-arduino arduino/ga100vfi` | 通过；app 893,008 B（程序空间 68%），全局变量 72,008 B（21%）；镜像内含 `0.3.1 (Nov 21 2026 11:11:09)` 构建串 |
+| 板上自证 | `BOARD=http://… IMG=… EXPECT=72d40a33f51444d9 bash bench/ota.sh` | `net.build = 0.3.1 (Nov 21 2026 11:11:09)`；控制器仍 IDLE、`FUSECTRL = 0xe0040000`（未受本轮刷写影响） |
+| 默认总线速率 | 冷启后不发 `@F`，读 `/api/status` + `@r 25 7e 1` | `baud = 1000000`（默认即 1 MHz），`STATUS_CML(0x7E) = 0x00`，即时 ACK |
+| 速率切换 | `@F 400000` → `@r 25 8b 2` → `@F 1000000` → `@r 25 8b 2` | 两次读回同为 `c9 02`；降级/回升都不需要重启，最终 `baud = 1000000` |
+| 发布门禁 | `python tools/package_firmware.py --prune/--check`、`gen_manifest.py`、`deploy_bench.py` | 镜像与 41 个固件源一致（sha256 `e599a0bff5ba9b0c…`）；清单与台架自检通过 |
+
+降级路径（1 MHz NACK → 400 kHz → 100 kHz）只有 `test/test_pmbus.c` 的替身用例覆盖：实卡上总线在 1 MHz 一直 ACK，没有真实降级事件可测。
+
 ## 0.3.0 — 2026-11-20
 
 | 范围 | 命令 | 结果 |

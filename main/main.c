@@ -59,6 +59,22 @@ static DRAM_ATTR struct { int32_t t_us; uint16_t raw; } s_vsamp[GA_VS_MAX];
 static int s_vsamp_n;
 static int32_t s_glitch_slip_us, s_reset_slip_us;
 
+/* Per-step timing profile: what the plan asked for vs. when the step really ran and how
+ * long it blocked. Free to take (two esp_timer reads per step, no bus traffic), and it
+ * answers the question that cost us the whole day of 2026-11-21: the dip's TRAILING edge
+ * is a blocking 1 MHz PMBus write too, so `pw` only says when we *ask* for the rail back.
+ * Measured reset_slip ranged 0..245 us, which is wider than the ~20 us window a hit needs
+ * -- that is why 60+ shots produced no DSOV movement while the author's bench hits 14 %.
+ * Recorded in DRAM inside the IRAM loop and printed after the run: printf in the loop
+ * would itself become the disturbance we are trying to measure. */
+#define GA_PROF_MAX 24
+static DRAM_ATTR struct {
+    int32_t want, got;
+    int16_t dur;
+    uint8_t act;
+} s_prof[GA_PROF_MAX];
+static int s_prof_n;
+
 static int64_t IRAM_ATTR now_us(void) { return esp_timer_get_time(); }
 static void IRAM_ATTR hb_touch(void) { s_hb = (uint32_t)now_us(); }
 
@@ -275,7 +291,7 @@ static int IRAM_ATTR glitch_run(const gstep_t *st, int ns, int64_t t0)
 {
     int wfail = 0;
     int64_t actual_reset = -1;
-    s_glitch_slip_us = 0; s_reset_slip_us = 0; s_vsamp_n = 0;
+    s_glitch_slip_us = 0; s_reset_slip_us = 0; s_vsamp_n = 0; s_prof_n = 0;
     for (int i = 0; i < ns; i++) {
         const gstep_t *s = &st[i];
         int64_t want = t0 + s->t_us;
@@ -287,6 +303,10 @@ static int IRAM_ATTR glitch_run(const gstep_t *st, int ns, int64_t t0)
         }
         int32_t slip = (int32_t)(now_us() - want);
         if (slip > s_glitch_slip_us) s_glitch_slip_us = slip;
+        // When the step actually started, recorded before the action blocks. Two counter
+        // reads and nothing else: no printf, no bus traffic inside the timing loop, so the
+        // measurement itself cannot become the disturbance.
+        int64_t step_start = now_us();
         s_fx.step_idx = (uint32_t)i; s_fx.step_act = s->act; s_fx.step_t = s->t_us;
         bool ok = true;
         switch (s->act) {
@@ -313,6 +333,13 @@ static int IRAM_ATTR glitch_run(const gstep_t *st, int ns, int64_t t0)
         default: ok = false; break;
         }
         hb_touch();
+        if (s_prof_n < GA_PROF_MAX) {   // end of step = when that write really landed
+            s_prof[s_prof_n].want = s->t_us;
+            s_prof[s_prof_n].got = (int32_t)(step_start - t0);
+            s_prof[s_prof_n].dur = (int16_t)(now_us() - step_start);
+            s_prof[s_prof_n].act = (uint8_t)s->act;
+            s_prof_n++;
+        }
         if (!ok) { wfail++; break; }   // stop actuation; caller performs recovery
     }
     pex_hold(false);
@@ -385,6 +412,12 @@ static bool board_execute_glitch(const glitch_args_t *input, int *writes_failed,
     result.seq = s_last.seq + 1; if (!result.seq) result.seq = 1;
     s_last = result; seq = result.seq;
     portEXIT_CRITICAL(&s_state_lock);
+    // The dip's TRAILING edge is a blocking PMBus write too, so `pw` only says when we
+    // *ask* for the rail back. These lines turn that into a measured number: got= is when
+    // the step ran relative to plan, dur= is how long its bus transaction blocked.
+    for (int i = 0; i < s_prof_n; i++)
+        printf("st %d act=%d want=%ld got=%ld dur=%dus\n", i, s_prof[i].act,
+               (long)s_prof[i].want, (long)s_prof[i].got, (int)s_prof[i].dur);
     printf("glitch done pwd=%d e1=0x%02x%02x writes_failed=%d slip=%ld reset_slip=%ld diag_ok=%d\n",
            !!(cml & 8),e1[1],e1[0],wfail,(long)s_glitch_slip_us,(long)s_reset_slip_us,diag_ok);
 finish:
@@ -473,12 +506,41 @@ static void dispatch(char *line)
     case 'r':
         printf("PEX_RST_BUF* low 100 ms (PCIe reset)\n");
         pex_hold(true); vTaskDelay(pdMS_TO_TICKS(100)); pex_hold(false); printf("released\n"); break;
-    case 'j': pex_hold(true); printf("PEX_RST_BUF* HELD low; send 'J' to release\n"); break;
+    case 'j': pex_hold(true); printf("PEX_RST_BUF* HELD low; send 'J' to release (auto-releases at %d ms)\n", GA_PEX_MAX_HOLD_MS); break;
     case 'J': pex_hold(false); printf("PEX_RST_BUF* released\n"); break;
     case 'b': s_fx.magic=FX_MAGIC_SW; printf("restart\n"); esp_restart(); break;
     default: printf("ERR unknown command\n"); break;
     }
     hb_touch(); hardware_leave();
+}
+
+/* Guards the one hardware knob a human can leave in a bad state: 'j' holds PEX_RST with
+ * no upper bound, and a forgotten hold is indistinguishable from a dead card -- we burned
+ * a power cycle on exactly that confusion (2026-11-21, one 10 s hold). 10 ms polling is
+ * an order of magnitude slower than the slowest plan step (~1 ms), so this can never
+ * interfere with shot timing; it only ever catches manual holds. */
+/* The decision itself, separate from the task so the offline model can drive it.
+ * Returns true when it forced the pad high. */
+static bool pex_guard_once(void)
+{
+    int64_t held = pex_held_us();
+    if (held <= (int64_t)GA_PEX_MAX_HOLD_MS * 1000) return false;
+    pex_hold(false);
+    // printf (not console_printf): main.c has the real printf and does not include
+    // console.h; the web log ring still sees it through the console redirect.
+    printf("PEX_RST held %lld ms > %d ms cap -> auto-released "
+           "(a forgotten 'j' looks exactly like a dead card)\n",
+           (long long)(held / 1000), GA_PEX_MAX_HOLD_MS);
+    return true;
+}
+
+static void pex_guard_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        (void)pex_guard_once();
+    }
 }
 
 static void executor_task(void *arg)
@@ -511,6 +573,9 @@ void ga_app_main(void)
     /* Below esp_timer's priority 22; all hardware driver init happens on core1. */
     ESP_ERROR_CHECK(xTaskCreatePinnedToCore(executor_task,"ga_executor",12288,NULL,
                                           8,NULL,1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    // Small stack, low priority, no core pinning: it only polls a timestamp every 10 ms.
+    ESP_ERROR_CHECK(xTaskCreate(pex_guard_task,"ga_pex_guard",2048,NULL,
+                                6,NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
 #ifndef ARDUINO
 void app_main(void) { ga_app_main(); }

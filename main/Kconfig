@@ -2,17 +2,21 @@ menu "GA100VFI glitcher"
 
 	choice GA_I2C_DEFAULT_BAUD
 		prompt "Default I2C bus speed (runtime switchable with @F)"
-		default GA_I2C_BAUD_400K
+		default GA_I2C_BAUD_1M
 		help
-		  The card's SMBus pull-ups are specified for 400 kHz (Fm); Fm+ rise
-		  times are not guaranteed, so 1 MHz is an experimental setting only.
+		  1 MHz is the reference rig's timing baseline: a 16-bit PMBus write
+		  takes 36 us instead of 90 us at 400 kHz, and the reference recipe's
+		  `delay` is calibrated against that. The card's SMBus pull-ups are
+		  specified for 400 kHz only, so the firmware proves the rate with a
+		  read-only probe at every bring-up and steps down 1 MHz -> 400 kHz
+		  -> 100 kHz by itself. Pick a lower value here to start lower.
 
 		config GA_I2C_BAUD_100K
 			bool "100 kHz"
 		config GA_I2C_BAUD_400K
-			bool "400 kHz (Fm, recommended)"
+			bool "400 kHz (Fm)"
 		config GA_I2C_BAUD_1M
-			bool "1 MHz (Fm+, experimental)"
+			bool "1 MHz (Fm+, reference baseline; auto-downgrade on failure)"
 	endchoice
 
 	config GA_I2C_BAUD_HZ

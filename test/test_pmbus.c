@@ -19,13 +19,19 @@ static unsigned clocks, starts, stops, nacks, stretch_at;
 static int old_sda = 1, old_scl = 1;
 static unsigned bus_inits, tx_count, last_speed, last_reg;
 static uint32_t last_reg_value;
+static uint32_t fail_speed;      /* 模拟这个速率上 NACK（0 = 全部正常） */
 struct native_bus { int unused; };
 struct native_dev { uint32_t speed; uint8_t addr; };
 static struct native_bus bus;
-static struct native_dev devices[64];
+static struct native_dev devices[256];
 static unsigned device_count;
 static unsigned log_calls, log_fragments;
 static char last_line[512];
+
+/* pex_hold() now stamps the pad so the firmware can enforce a hold ceiling, so the
+ * model has to hand it a clock the test can move forward. */
+static int64_t g_fake_us;
+int64_t esp_timer_get_time(void) { return g_fake_us; }
 
 static int master_level(int pin)
 {
@@ -98,7 +104,11 @@ esp_err_t i2c_master_receive(i2c_master_dev_handle_t dev, uint8_t *p, size_t n, 
 { (void)timeout; memset(p, 0, n); last_speed = dev->speed; return ESP_OK; }
 esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t dev,
     const uint8_t *a, size_t na, uint8_t *b, size_t nb, int timeout)
-{ (void)a; (void)na; return i2c_master_receive(dev, b, nb, timeout); }
+{
+    (void)a; (void)na;
+    if (fail_speed && dev->speed == fail_speed) { last_speed = dev->speed; return ESP_FAIL; }
+    return i2c_master_receive(dev, b, nb, timeout);
+}
 esp_err_t i2c_master_probe(i2c_master_bus_handle_t h, uint16_t addr, int timeout)
 { (void)h; (void)addr; (void)timeout; return ESP_FAIL; }
 
@@ -199,12 +209,60 @@ static void test_reset_gpio_bank(void)
     CHECK(direction[PIN_PEX_RST] == GPIO_MODE_OUTPUT_OD);
 }
 
+/* The hold ceiling is only a red line if something can measure the hold. GA_PEX_MAX_HOLD_MS
+ * plus pex_held_us() is what lets the guard task release a forgotten 'j' by itself, after
+ * a 10 s manual hold cost us a power cycle (2026-11-21). */
+static void test_pex_hold_is_time_stamped(void)
+{
+    g_fake_us = 1000;
+    pex_hold(false);
+    CHECK(pex_held_us() == 0);            /* released: nothing to time */
+    g_fake_us = 5000;
+    pex_hold(true);
+    g_fake_us = 5000 + GA_PEX_MAX_HOLD_MS * 1000LL + 1;
+    CHECK(pex_held_us() > (int64_t)GA_PEX_MAX_HOLD_MS * 1000);  /* guard would fire here */
+    pex_hold(false);
+    CHECK(pex_held_us() == 0);            /* releasing must clear the stamp */
+    pex_hold(true);
+    g_fake_us += 500;
+    CHECK(pex_held_us() == 500);           /* a plan's ~1 ms hold stays far below the cap */
+    pex_hold(false);
+}
+
+static void test_baud_falls_back_when_probe_fails(void)
+{
+    pmbus_down();
+    external_pulls = true;
+    fail_speed = 1000000;
+    CHECK(pmbus_set_baud(1000000));
+    CHECK(pmbus_up());
+    /* 请求 1 MHz，总线在 1 MHz 上 NACK：必须自己退到 400 kHz */
+    CHECK(pmbus_requested_baud_hz() == 1000000);
+    CHECK(pmbus_baud_hz() == 400000 && pmbus_write_us() == 90);
+    CHECK(last_speed == 400000);
+
+    /* 降级后的 bring-up 不再去撞 1 MHz：既不重复打印，也不重复探测 */
+    unsigned calls = log_calls;
+    pmbus_down();
+    CHECK(pmbus_up());
+    CHECK(pmbus_baud_hz() == 400000);
+    CHECK(log_calls == calls);
+
+    /* 显式再要 1 MHz 时梯子重新武装（总线恢复后应当能直接上去） */
+    fail_speed = 0;
+    CHECK(pmbus_set_baud(1000000) && pmbus_up());
+    CHECK(pmbus_baud_hz() == 1000000 && pmbus_write_us() == 36);
+    pmbus_down();
+}
+
 int main(void)
 {
     test_effective_baud_and_holds();
     test_scan_completes_each_read_and_stop();
     test_rejected_commands_do_not_write();
     test_reset_gpio_bank();
+    test_pex_hold_is_time_stamped();
+    test_baud_falls_back_when_probe_fails();
     printf("pmbus: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

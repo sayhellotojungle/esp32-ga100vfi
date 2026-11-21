@@ -35,6 +35,13 @@ bool pmbus_raw_read(uint8_t addr, uint8_t *buf, int n);
 void pex_init(void);
 void pex_hold(bool low);
 
+// Microseconds PEX_RST has been held low, or 0 while released. The console 'j'
+// command has no blocking counterpart -- it returns immediately and leaves the
+// pad low until 'J' -- so this is what the guard task watches. See
+// GA_PEX_MAX_HOLD_MS in board.h: a long manual hold is a hardware action we
+// stopped trusting people to remember (2026-11-21).
+int64_t pex_held_us(void);
+
 // Hold SCL low (deinit the bus first) / release it to hi-Z. Used by @L/@U
 // and by the glitch timeline's SCL-hold steps.
 void pmbus_scl_hold(bool low);

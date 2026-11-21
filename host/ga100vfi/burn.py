@@ -68,15 +68,25 @@ def replay(rows: dict) -> tuple:
     return blocks, holders
 
 
-def crosscheck(snapshot_rows: dict, plan: dict) -> list:
+def crosscheck(snapshot_rows: dict, plan: dict, resumed=()) -> list:
     """Cross-check a burn plan against an FF snapshot. Returns problem strings.
 
     Pure stdlib, offline: encoding recompute, IFF, clear-only rule, old values vs
     replay, target rows blank, plan uniqueness, override order, post-burn replay.
     For option-word analysis use `ffcalc verify` on top (recommended, not required).
+
+    `resumed` lists the rows that **already hold this plan's own record** — an
+    interrupted run that stopped between two records. FF is append-only with
+    last-writer-wins, so those rows are already at the plan's end state, and the three
+    checks that describe the state *before* the burn ("target row not blank", "old must
+    equal the replay", "must override the holder") are false statements about them.
+    Without this, burning the first row on its own makes the pre-burn snapshot contradict
+    the plan, and the tool refuses to finish a burn it is exactly one record into —
+    measured on the bench 2026-11-21 (row 301 burned first, rows 302..311 to go).
     """
     rows = {int(k): int(v, 0) if isinstance(v, str) else int(v)
             for k, v in snapshot_rows.items()}
+    resumed = {int(r) for r in resumed}
     problems = []
     burned, seen_cb = {}, {}
     for rec in plan["burn"]:
@@ -95,7 +105,13 @@ def crosscheck(snapshot_rows: dict, plan: dict) -> list:
             problems.append(f"{tag}: re-encode mismatch")
         if new & ~old:
             problems.append(f"{tag}: clear-only violated (new & ~old = 0x%x)" % (new & ~old))
-        if rows.get(row, 0) != 0:
+        if row in resumed:
+            # 声称"已落地"就必须真落地：读回不是本条记录的行不配走续烧通道（burn_plan 传进来
+            # 的就是现场读回，所以这里是在防"把别人的行当自己人"）。
+            if rows.get(row, 0) != record:
+                problems.append(f"{tag}: listed as resumed but the snapshot reads "
+                                f"0x{rows.get(row, 0):08x}")
+        elif rows.get(row, 0) != 0:
             problems.append(f"{tag}: target row not blank in snapshot "
                             f"(reads 0x{rows[row]:08x})")
         cb = (rec["chain"], rec["block"])
@@ -105,14 +121,17 @@ def crosscheck(snapshot_rows: dict, plan: dict) -> list:
         burned[row] = record
     blocks, holders = replay(rows)
     for rec in plan["burn"]:
+        row = int(rec["row"])
+        if row in resumed:
+            continue                      # old/holder checks describe the pre-burn state
         cb = (rec["chain"], rec["block"])
         cur = blocks.get(cb)
         if cur != int(rec["old"], 16):
-            problems.append(f"row {rec['row']}: old={rec['old']} but snapshot replay "
+            problems.append(f"row {row}: old={rec['old']} but snapshot replay "
                             f"of chain.block {cb} gives "
                             + ("no record" if cur is None else hex(cur)))
-        elif cb in holders and int(rec["row"]) <= holders[cb]:
-            problems.append(f"row {rec['row']}: does not override existing record at "
+        elif cb in holders and row <= holders[cb]:
+            problems.append(f"row {row}: does not override existing record at "
                             f"row {holders[cb]} for chain.block {cb}")
     merged = dict(rows)
     merged.update(burned)
@@ -134,6 +153,7 @@ class FuseMacro:
 
     def __init__(self, rd, wr, sleep=time.sleep, clock=time.monotonic):
         self.rd, self.wr, self.sleep, self.clock = rd, wr, sleep, clock
+        self._wrote_wdata = False
 
     @classmethod
     def for_bdf(cls, bdf: str) -> "FuseMacro":
@@ -190,7 +210,15 @@ class FuseMacro:
         self.wr(FUSEADDR, orig)
         return value
 
-    def capture_rows(self, first: int = 0, last: int = ROW_COUNT - 1) -> dict:
+    # 快照的**可信区间**：0..FF_ROW_MAX。IFF 区（487..511）以前也照抓照存，但 2026-11-21 与另一条
+    # 独立采集路径（内核 ffprobe 的 CMD_READ pass）逐行对比时发现：FF 区 0/265 差异，而 IFF 区
+    # 20/25 行对不上，且我们这边读回的是满值域的高熵数据、两边行号怎么错位都对不齐。也就是说
+    # **我们这条路径读 IFF 读回来的是不可信的数据**，而不是"这张卡的 IFF 长这样"。
+    # 为什么要把它写死在默认值里而不是留个注释：`replay()` 本来就只看 FF 区，所以这份数据错了不
+    # 会当场出事 —— 它会被后来的人当成事实引用（我们差点拿它去论证"两张卡不是同一块 die"）。
+    # 读不到就干脆别写进快照，与 ffcalc 的"行读不全 ⇒ 拒绝出计划"是同一条纪律。
+    def capture_rows(self, first: int = 0, last: int = FF_ROW_MAX) -> dict:
+        """逐行 CMD_READ。默认只覆盖到 FF 区末尾（见上面的可信区间注释）。"""
         rows = {}
         for row in range(first, last + 1):
             rows[row] = self.read_row(row)
@@ -210,6 +238,7 @@ class FuseMacro:
         """Shadow SBFE=0 and open the write PLM, then assert the full armed state."""
         self.wr(SBFE_SHADOW, 0)
         self.wr(WDATA_WR_SECURE, 0)
+        self._wrote_wdata = False            # 从这一刻起，写口的非零值只可能是我们自己留的
         problems = self.armed_problems()
         if problems:
             raise FuseError("armed assertions failed: " + "; ".join(problems))
@@ -231,7 +260,11 @@ class FuseMacro:
             problems.append(f"SBFE shadow={st['sbfe']} != 0")
         if st["wdata_wr_secure"] != 0:
             problems.append(f"WDATA_WR_SECURE={st['wdata_wr_secure']} != 0")
-        if self.rd(FUSEWDATA) != 0:
+        if self.rd(FUSEWDATA) != 0 and not self._wrote_wdata:
+            # 只在**第一条记录之前**要求写口读回 0。它是写口，不是状态寄存器：我们给上一条
+            # 记录写进去的值就停在那儿（`arm()` 之后我们就是唯一写过它的人），把它当成
+            # "写口不干净"会让任何一次多于一条的烧写自己拒绝自己 —— 断点续烧（先试烧一行
+            # 再烧其余）走的正是这条路。
             problems.append("FUSEWDATA write port not readable-as-zero")
         return problems
 
@@ -247,6 +280,7 @@ class FuseMacro:
         if self.rd(FUSEADDR) != row:
             raise FuseError(f"FUSEADDR did not latch row {row}")
         self.wr(FUSEWDATA, record)
+        self._wrote_wdata = True        # 之后写口读回非零是我们自己留的，不算脏（见 armed_problems）
         self.wr(FUSECTRL, CMD_PROGRAM)
         if not self._wait_idle(PROGRAM_TIMEOUT_S):
             raise FuseError(f"PROGRAM at row {row} did not return to IDLE "
@@ -256,6 +290,101 @@ class FuseMacro:
         if got != record:
             raise FuseError(f"row {row} readback 0x{got:08x} != 0x{record:08x}")
         return got
+
+
+def diff_snapshots(before: dict, after: dict, plan: dict = None,
+                   first: int = FF_ROW_MIN, last: int = FF_ROW_MAX) -> dict:
+    """Compare two FF snapshots taken around a burn; report whether the delta is *exactly*
+    the plan.
+
+    "烧成功了" 与 "只烧了该烧的行" 是两件事：前者只看回读的那几行，后者要求**其余每一行都没动**。
+    这一条 2026-11-21 是手工做的（两次独立重读 512 行逐行对），所以它必须是个函数：靠人当场
+    数差异，数错一次就是一张已经烧进去 11 行的卡。
+
+    只比较 FF 区（`first..last`，默认 222..486）：regular 区被驱动/devinit 动过不算熔丝，
+    IFF 区（487..511）我们这条路径读不准（见 `capture_rows` 的注释），拿它做判据就是拿噪声
+    当证据。
+    """
+    def norm(d):
+        return {int(k): int(v, 0) if isinstance(v, str) else int(v) for k, v in d.items()}
+
+    a, b = norm(before), norm(after)
+    keys = set(a) | set(b)
+    changed = sorted(r for r in keys if first <= r <= last and a.get(r, 0) != b.get(r, 0))
+    out = {"changed": changed, "expected": [], "unexpected": [], "missing": [],
+           "mismatch": []}
+    if plan is None:
+        return out
+    want = {int(r["row"]): int(r["record"], 16) for r in plan["burn"]}
+    out["expected"] = sorted(r for r in changed if r in want and b.get(r) == want[r])
+    out["unexpected"] = sorted(r for r in changed if r not in want)
+    out["mismatch"] = sorted(r for r in changed if r in want and b.get(r) != want[r])
+    # 计划里"本来就该是这个值"的行（续烧）不算 missing：它们没变化正是因为已经落地。
+    out["missing"] = sorted(r for r in want
+                            if r not in changed and b.get(r, 0) != want[r]
+                            and a.get(r, 0) != want[r])
+    return out
+
+
+def burn_plan(macro, plan: dict, snapshot_rows: dict, rows=None, log=print) -> int:
+    """Run the whole burn procedure inside an open window. Returns a process exit code.
+
+    顺序就是 2026-11-21 手工走的那一遍，区别是每一步现在都会自己拒绝：
+
+      1. **先现场回读计划涉及的每一行**（顺带证明 BAR0 真的可读），把"已是本条记录"的行认成
+         续烧、把"是别的值"的行当成事故直接拒绝 —— 往一个非零非目标值的行里 PROGRAM 是唯一
+         一种救不回来的操作；
+      2. 离线 cross-check（含续烧行的豁免，见 `crosscheck()`）；
+      3. 窗口判据 → `CMD_SENSE`（`DSOV` 必须仍为 0）→ `arm` + 七项断言；
+      4. 逐条：写前再读一次、`CMD_PROGRAM`、等 IDLE、回读必须等于记录值；
+      5. 收尾打印 `CRC`/`FUSEDEBUG`/`DSOV`，让日志里留下"最后一发之后控制器没受伤"。
+    """
+    wanted = None if not rows else {int(x) for x in rows}
+    all_rows = {int(r["row"]): int(r["record"], 16) for r in plan["burn"]}
+    if wanted:
+        unknown = wanted - set(all_rows)
+        if unknown:
+            log("REFUSED: rows %s not in plan" % sorted(unknown))
+            return 1
+    records = [r for r in plan["burn"] if wanted is None or int(r["row"]) in wanted]
+
+    live = {row: macro.read_row(row) for row in sorted(all_rows)}
+    resumed = sorted(row for row, rec in all_rows.items() if live[row] == rec)
+    foreign = sorted((row, val) for row, val in live.items()
+                     if val not in (0, all_rows[row]))
+    log("现场回读 %d 行：%d 行已是本计划记录（跳过），%d 行空白"
+        % (len(live), len(resumed), len(live) - len(resumed)))
+    if foreign:
+        for row, val in foreign:
+            log("REFUSED: row %d 读回 0x%08x，既不是空白也不是本计划记录 —— "
+                "这块 die 的目标行被人动过，先查清再烧" % (row, val))
+        return 1
+
+    problems = crosscheck(snapshot_rows, plan, resumed)
+    for p in problems:
+        log("FAIL: " + p)
+    if problems:
+        log("cross-check failed — refusing to burn")
+        return 1
+
+    if not macro.window_ok():
+        log("no goldilocks window, aborting: %s" % (macro.status(),))
+        return 2
+    macro.sense()
+    macro.arm()
+    log("armed; burning %d record(s)..." % len(records))
+    for rec in records:
+        row = int(rec["row"])
+        if row in resumed:
+            log("skip row %3d 已是 0x%08x（续烧）" % (row, live[row]))
+            continue
+        got = macro.burn(row, int(rec["record"], 16))
+        log("OK row %3d 0x%08x fields=%s" % (row, got, rec.get("fields")))
+    st = macro.status()
+    log("post: CRC=0x%x DSOV=%d FUSEDEBUG=0x%x FUSECTRL=0x%08x"
+        % (st["crc"], st["dsov"], st["fusedebug"], st["fusectrl"]))
+    log("done — cold-boot required for the new FF chain to take effect")
+    return 0
 
 
 def _load_rows(path: str) -> dict:
@@ -294,6 +423,18 @@ def main(argv=None) -> int:
     p_burn.add_argument("plan", help="burn plan json")
     p_burn.add_argument("--rows", help="comma-separated row subset (e.g. test row first)")
     p_burn.add_argument("--yes", action="store_true", help="skip interactive confirm")
+
+    # 两个纯离线/纯配置空间的子命令。它们存在的理由都是"这件事以前是人肉做的"：
+    # `diffrows` 是烧完之后逐行对两次快照（今天手工做的最后一步）；`wake` 是
+    # "BAR0 读回全 0xff" 的第一处置 —— 冷启动后没有驱动 claim 这张卡时 Command=0x0000，
+    # 每个 BAR0 读都是 0xffffffff，与掉卡长得一模一样。
+    p_diff = sub.add_parser("diffrows",
+                            help="offline: two FF snapshots vs the plan (only planned rows?)")
+    p_diff.add_argument("before", help="snapshot before the burn (rows.txt or dump json)")
+    p_diff.add_argument("after", help="snapshot after the burn / after cold boot")
+    p_diff.add_argument("--plan", help="burn plan json; without it only the delta is shown")
+
+    sub.add_parser("wake", help="set Memory Space Enable so BAR0 stops reading all-ones")
 
     args = ap.parse_args(argv)
 
@@ -345,44 +486,51 @@ def main(argv=None) -> int:
             bar.close()
         return 0
 
+    if args.cmd == "wake":
+        from .bar0 import ensure_memory_enable
+        r = ensure_memory_enable(args.bdf)
+        if r is None:
+            print(f"{args.bdf}: 配置空间读不到（全 0xff 或节点不存在）—— 这是掉卡/没电，"
+                  "不是 memory enable 没开；先按 bench/README「卡不见了」那节分形状")
+            return 3
+        print(f"{args.bdf}: Command {r['before']:#06x} -> {r['after']:#06x}"
+              + ("（原本已开）" if not r["changed"] else "（本次打开 memory decode）")
+              + f"；BAR0 现在{'可读' if r['bar0_ok'] else '仍读回 0xffffffff'}")
+        return 0 if r["after"] & 0x2 else 1
+
+    if args.cmd == "diffrows":
+        before, after = _load_rows(args.before), _load_rows(args.after)
+        plan = json.load(open(args.plan)) if args.plan else None
+        d = diff_snapshots(before, after, plan)
+        print("变化 %d 行：%s" % (len(d["changed"]), d["changed"] or "无"))
+        if plan:
+            print("   与计划记录相符：%s" % (d["expected"] or "无"))
+            print("   计划内但没落地：%s" % (d["missing"] or "无"))
+            print("   计划外的改动：%s" % (d["unexpected"] or "无"))
+            print("   变化了却不等于计划记录：%s" % (d["mismatch"] or "无"))
+            bad = d["missing"] + d["unexpected"] + d["mismatch"]
+            print("结论：只有计划内的行按记录改变" if not bad
+                  else "结论：差异与计划不一致 → 停下来查，别再烧")
+            return 1 if bad else 0
+        return 0
+
     if args.cmd == "burn":
         rows = _load_rows(args.snapshot)
         plan = json.load(open(args.plan))
-        wanted = None
-        if args.rows:
-            wanted = {int(x) for x in args.rows.split(",")}
-        records = [r for r in plan["burn"]
-                   if wanted is None or int(r["row"]) in wanted]
-        problems = crosscheck(rows, plan)
-        for p in problems:
-            print("FAIL:", p)
-        if problems:
-            print("cross-check failed — refusing to burn")
-            return 1
         if not args.yes:
-            input(f"burn {len(records)} record(s) irreversibly? Enter to continue: ")
+            n = len(plan["burn"]) if not args.rows else len(
+                [r for r in plan["burn"] if int(r["row"]) in
+                 {int(x) for x in args.rows.split(",")}])
+            input(f"burn {n} record(s) irreversibly? Enter to continue: ")
         macro, bar = FuseMacro.for_bdf(args.bdf)
         try:
-            if not macro.window_ok():
-                print("no goldilocks window (status shown below); aborting")
-                print(macro.status())
-                return 2
-            macro.sense()
-            macro.arm()
-            print("armed, burning %d record(s)..." % len(records))
-            for rec in records:
-                got = macro.burn(int(rec["row"]), int(rec["record"], 16))
-                print(f"OK row {rec['row']:3d} 0x{got:08x} fields={rec.get('fields')}")
-            st = macro.status()
-            print("post: CRC=0x%x DSOV=%d FUSEDEBUG=0x%x"
-                  % (st["crc"], st["dsov"], st["fusedebug"]))
-            print("done — cold-boot required for the new FF chain to take effect")
+            return burn_plan(macro, plan, rows,
+                             rows=args.rows.split(",") if args.rows else None)
         except FuseError as e:
             print("STOP:", e)
             return 2
         finally:
             bar.close()
-        return 0
 
     return 2
 
