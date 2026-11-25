@@ -195,7 +195,15 @@ MIN_SHOTS_TO_ESCALATE = FREEZE_AFTER   # 同一个数两种用途：攒够才升
 
 
 def family_stats(shots: list, pw: int, delay: int) -> dict:
-    """一个族（pw × 相位档 = 单发能量 × 相位）到今天为止的战绩。"""
+    """一个族（pw × 相位档 = 单发能量 × 相位）到今天为止的战绩。
+
+    **已知缺口（2026-11-24，第三张卡）**：族键里没有 `pulses`，而脉冲数是独立的一维致死量。
+    那张卡在 `pw=222` 相位档 40 这一族里同时有 `3×222@vd=380 -> dead` 与 `1×222@vd=380 ->
+    under`（同深度、同 td、同 gap，只差脉冲数；命中的那发在相位档 80，也是 `1×222`）。所以本
+    函数汇总出的"这一族的事故率"混合了两种不同形状 —— 用它做决定前得回看运行目录里的逐发
+    坐标，别把族号当形状号。把 pulses 收进族键是判据变更（会改冻结行为），要先动
+    host/tests/test_envelope.py。
+    """
     fam = [s for s in shots if s.fired and s.pw == pw and phase_bucket(s.delay) == phase_bucket(delay)]
     return {"n": len(fam),
             "responded": any(s.progress for s in fam),

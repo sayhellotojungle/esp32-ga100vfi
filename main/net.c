@@ -2,6 +2,7 @@
 #include "console.h"
 #include "campaign.h"
 #include "oracle.h"
+#include "peer.h"
 #include "webui.h"
 #include "board.h"
 #include "board_runtime.h"
@@ -344,20 +345,49 @@ static esp_err_t uri_root(httpd_req_t *r)
     return httpd_resp_send(r, WEBUI_HTML, sizeof WEBUI_HTML - 1);
 }
 
-static char s_status_buf[2048];
+/* The page's start request (see peer.h). The board stores it for the judge host and
+ * deliberately does not parse the campaign parameters inside: the agent owns those, and
+ * a board that half-parsed them would be a second place to get one wrong. What it does
+ * check is that the request can be handed over intact, that it can still be honoured
+ * (a run already going means there is nothing to start), and how long it stays valid.
+ */
+static esp_err_t uri_req(httpd_req_t *r)
+{
+    char qs[QUERY_MAX], v[24], error[96];
+    uint32_t seq;
+    if (!read_query(r, qs, sizeof qs) || qget(qs, "op", v, sizeof v) != 1)
+        return reply(r, "400 Bad Request", "op=start or op=cancel required");
+    if (!strcmp(v, "cancel")) {
+        bool had = peer_request_cancel();
+        return reply(r, had ? "200 OK" : "409 Conflict",
+                     had ? "request withdrawn" : "no request pending");
+    }
+    if (strcmp(v, "start")) return reply(r, "400 Bad Request", "unknown request operation");
+    if (qget(qs, "seq", v, sizeof v) != 1 || !parse_u32(v, &seq) || !seq)
+        return reply(r, "400 Bad Request", "seq must be a non-zero decimal sequence");
+    if (campaign_is_running() || board_is_busy())
+        return reply(r, "409 Conflict", "a campaign is already running");
+    if (!peer_request_post(qs, seq, error, sizeof error))
+        return reply(r, "400 Bad Request", error);
+    return reply(r, "200 OK",
+                 "request stored for the judge host; valid 10 s unless claimed");
+}
+
+static char s_status_buf[3072];
 static esp_err_t uri_status(httpd_req_t *r)
 {
-    char board[768], camp[768], ip[16];
+    char board[768], camp[768], peer[512], ip[16];
     board_status_json(board, sizeof board);
     campaign_status_json(camp, sizeof camp);
+    peer_render(peer, sizeof peer);
     bool up = net_snapshot(ip);
     wifi_ap_record_t ap;
     int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
     int n = snprintf(s_status_buf, sizeof s_status_buf,
              "{\"net\":{\"sta\":%s,\"ip\":\"%s\",\"rssi\":%d,\"ap\":\"%s\","
              "\"build\":\"" GA_BUILD "\"},"
-             "\"board\":%s,\"campaign\":%s}",
-             up ? "true" : "false", ip, rssi, GA_AP_SSID, board, camp);
+             "\"board\":%s,\"campaign\":%s,\"peer\":%s}",
+             up ? "true" : "false", ip, rssi, GA_AP_SSID, board, camp, peer);
     if (n < 0 || n >= (int)sizeof s_status_buf)
         return reply(r, "500 Internal Server Error", "status exceeds response buffer");
     httpd_resp_set_type(r, "application/json");
@@ -413,11 +443,19 @@ static esp_err_t uri_campaign(httpd_req_t *r)
         return reply(r, "200 OK", "stopping");
     }
     if (strcmp(v, "start")) return reply(r, "400 Bad Request", "unknown campaign operation");
+    // 0.4.1 deleted the on-board SMBPBI oracle, so there is no verdict mode to
+    // choose. `mode=1` is still accepted (callers and pages built before 0.4.1
+    // send it); `mode=0` is refused instead of being silently ignored, because a
+    // caller that asked for the board to judge itself must learn that nobody
+    // will answer it and every shot will time out. Checked before the busy test:
+    // the answer must depend on the request, not on what the board is doing.
+    if (qget(qs, "mode", v, sizeof v) == 1 && strcmp(v, "1"))
+        return reply(r, "400 Bad Request",
+                     "mode removed: the board has no on-board oracle, "
+                     "verdicts arrive via /api/verdict");
     if (campaign_is_running() || board_is_busy()) return reply(r, "409 Conflict", "board busy");
     campaign_cfg_t cfg = campaign_defaults;
-    cfg.oracle_mode = -1;
-    if (!qint(qs, "mode", &cfg.oracle_mode) ||
-        !qint(qs, "vd", &cfg.vd) || !qint(qs, "td", &cfg.td) ||
+    if (!qint(qs, "vd", &cfg.vd) || !qint(qs, "td", &cfg.td) ||
         !qint(qs, "vr", &cfg.vr) || !qint(qs, "tr", &cfg.tr) ||
         !qint(qs, "batch", &cfg.batch) || !qint(qs, "max", &cfg.max_attempts) ||
         !qint(qs, "minv", &cfg.min_v) || !qint(qs, "maxv", &cfg.max_v) ||
@@ -531,6 +569,12 @@ static void net_start_server(void)
     c.stack_size = 8192;
     c.core_id = 0;
     c.lru_purge_enable = true;
+    // The default handler table is 8 entries, and 0.5.0 added a ninth route: the
+    // registration failed, ESP_ERROR_CHECK aborted, and the board reboot-looped with the
+    // HTTP server never up -- the one failure mode a bench that hangs off a card must not
+    // have, because the only symptom at the rack is "the box stopped answering". 16 gives
+    // room for routes without counting them again at every release.
+    c.max_uri_handlers = 16;
     if (httpd_start(&s_httpd, &c) != ESP_OK) {
         console_printf("ERR http start failed\n");
         return;
@@ -541,10 +585,16 @@ static void net_start_server(void)
         { .uri = "/api/log",      .method = HTTP_GET,  .handler = uri_log },
         { .uri = "/api/cmd",      .method = HTTP_POST, .handler = uri_cmd },
         { .uri = "/api/campaign", .method = HTTP_GET,  .handler = uri_campaign },
+        { .uri = "/api/req",      .method = HTTP_GET,  .handler = uri_req },
         { .uri = "/api/verdict",  .method = HTTP_GET,  .handler = uri_verdict },
         { .uri = "/api/wifi",     .method = HTTP_GET,  .handler = uri_wifi },
         { .uri = "/api/ota",      .method = HTTP_POST, .handler = uri_ota },
     };
+    // A route that cannot register is named and survivable, not fatal: the page will show
+    // that one endpoint as an error, and the console says which one at boot. What must not
+    // happen is the whole board going quiet because of one missing table slot.
     for (size_t i = 0; i < sizeof uris / sizeof uris[0]; i++)
-        ESP_ERROR_CHECK(httpd_register_uri_handler(s_httpd, &uris[i]));
+        if (httpd_register_uri_handler(s_httpd, &uris[i]) != ESP_OK)
+            console_printf("ERR http route %s not registered (handler table full?)\n",
+                           uris[i].uri);
 }

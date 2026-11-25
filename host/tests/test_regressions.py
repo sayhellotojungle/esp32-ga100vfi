@@ -380,9 +380,15 @@ class ClassificationRules(unittest.TestCase):
         self.assertEqual(attempt_outcome(Verdict(0, 0, 1, 0xffffffff, 0x10055)), 'over')
 
 
-def waiting(session=11, attempt=1, mode=1, active=True):
-    return {'campaign': {'running': active, 'mode': mode,
-                         'awaiting_verdict': active,
+def waiting(session=11, attempt=1, active=True, awaiting=True):
+    """A /api/status reply in which the board is waiting for this shot's verdict.
+
+    0.4.1 removed the board's `mode` field along with the on-board SMBPBI oracle:
+    after the settle interval a shot is always waiting for the host, so the shapes
+    the agent must ignore are "not running", "not awaiting" and a missing token.
+    """
+    return {'campaign': {'running': active,
+                         'awaiting_verdict': active and awaiting,
                          'session': session, 'attempt': attempt}}
 
 
@@ -542,12 +548,25 @@ class AgentDelivery(unittest.TestCase):
         self.assertEqual(agent.evaluate((11, 5)), "under")    # 重试这一拍什么都没读
         self.assertIn("DSOV=0x00000001", agent.regs_line())
 
-    def test_does_not_observe_automatic_or_nonwaiting_campaign(self):
-        for state in (waiting(mode=0), waiting(active=False)):
-            agent = self.agent(state)
-            self.assertFalse(agent.step())
-            agent.gpu_verdict.assert_not_called()
-            agent.feed.assert_not_called()
+    def test_does_not_observe_nonwaiting_campaign(self):
+        """0.4.1：板子只有一个判决来源，所以"该不该去判"只看运行/等待/令牌三件事。
+
+        以前这里还要看 `mode`：`mode=0` 是板载 SMBPBI 自判，代理不许插手。那个模式已
+        被删除（本台架四次 SMBPBI 读全部无回执），继续留着 `mode` 只会让人以为存在一条
+        "板子自己会判"的退路。
+        """
+        cases = {
+            "没在跑": waiting(active=False),
+            "还在 settle": waiting(awaiting=False),
+            "令牌无效": waiting(session=0),
+            "字段缺失": {'campaign': {'running': True}},
+        }
+        for label, state in cases.items():
+            with self.subTest(case=label):
+                agent = self.agent(state)
+                self.assertFalse(agent.step())
+                agent.gpu_verdict.assert_not_called()
+                agent.feed.assert_not_called()
 
     def test_discards_result_if_campaign_changes_before_post(self):
         agent = self.agent()

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Deliver correlated PCIe verdicts to an ESP32 campaign in host/manual mode.
+"""Deliver correlated PCIe verdicts to an ESP32 campaign.
 
 Run on the card's Linux host:
     sudo python3 host/ga100vfi_agent.py http://192.168.4.1 --bdf 0000:01:00.0
 
-Only campaigns explicitly waiting for a verdict are inspected. A verdict is
+Since 0.4.1 the board cannot judge a shot at all: every shot waits for the host,
+so this agent (or a human on the web page) is the only thing that advances a
+campaign. Only campaigns waiting for a verdict are inspected. A verdict is
 retained until the board acknowledges it; retrying never repeats the register
 classification, which itself writes DSOV. Importing this module opens no device.
 """
@@ -31,8 +33,16 @@ Token = tuple[int, int]
 
 
 def awaiting_token(status: dict) -> Token | None:
+    """The shot the board is waiting on, or None.
+
+    0.4.1: the board has no on-board oracle, so `awaiting_verdict` after the settle
+    interval is the whole condition — there is no mode in which the board judges a
+    shot by itself. The token still has to be a real (session, attempt) pair: a
+    status block that predates a restart carries a session this agent's verdict
+    would be applied to the wrong shot.
+    """
     c = status.get("campaign", {})
-    if not c.get("running") or c.get("mode") != 1 or not c.get("awaiting_verdict"):
+    if not c.get("running") or not c.get("awaiting_verdict"):
         return None
     session, attempt = c.get("session"), c.get("attempt")
     if not all(type(x) is int and 0 < x <= 0xFFFFFFFF for x in (session, attempt)):

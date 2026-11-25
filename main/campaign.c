@@ -17,7 +17,7 @@
 
 typedef enum {
     ST_IDLE, ST_READY, ST_EXECUTING, ST_SETTLE, ST_WAIT_VERDICT,
-    ST_CHECKING, ST_RESTORE, ST_RESTORING
+    ST_RESTORE, ST_RESTORING
 } state_t;
 
 typedef struct {
@@ -29,7 +29,7 @@ typedef struct {
 typedef struct {
     bool running, goldilocks, awaiting_verdict, stop_requested, restore_ok;
     char phase[20];
-    int delay, v_dip, step, mode;
+    int delay, v_dip, step;
     int tries, valid, lost, nack, timeouts, under, over, hit;
     int best_delay, best_vdip;
     uint32_t session, attempt, sequence;
@@ -85,8 +85,6 @@ bool campaign_cfg_validate(const campaign_cfg_t *cfg, char *error, size_t n)
     if (!cfg) return config_error(error, n, "missing campaign config");
     if (cfg->ndelays < 1 || cfg->ndelays > 6)
         return config_error(error, n, "ndelays must be 1..6");
-    if (cfg->oracle_mode < -1 || cfg->oracle_mode > 1)
-        return config_error(error, n, "mode must be 0 or 1");
     if (cfg->max_attempts < 0 || cfg->max_attempts > CAMPAIGN_MAX_ATTEMPTS)
         return config_error(error, n, "max must be 0..1000000");
     if (cfg->batch < 0 || cfg->batch > CAMPAIGN_MAX_BATCH)
@@ -111,7 +109,6 @@ bool campaign_cfg_validate(const campaign_cfg_t *cfg, char *error, size_t n)
 
 void campaign_init(campaign_execute_fn execute, campaign_restore_fn restore)
 {
-    oracle_init();
     if (!s_mx) s_mx = xSemaphoreCreateMutex();
     s_execute = execute;
     s_restore = restore;
@@ -142,12 +139,11 @@ bool campaign_start(const campaign_cfg_t *cfg)
     uint32_t session;
     do { session = esp_random(); } while (!session || session == previous_session);
     s_cfg = *cfg;
-    int mode = cfg->oracle_mode < 0 ? oracle_get_mode() : cfg->oracle_mode;
-    // No rejected/busy request may change the oracle of an active campaign.
-    oracle_set_mode(mode);
+    // Nothing to pick per run any more: every shot is judged by the host, so a
+    // rejected or busy request cannot leave a stale verdict mode behind either.
     memset(&s_st, 0, sizeof s_st);
     s_st.running = true; s_st.restore_ok = true;
-    s_st.session = session; s_st.mode = mode;
+    s_st.session = session;
     memset(s_points, 0, sizeof s_points);
     for (int i = 0; i < cfg->ndelays; i++) {
         s_points[i].vd = cfg->vd;
@@ -186,7 +182,7 @@ bool campaign_submit_verdict(uint32_t session, uint32_t attempt, oracle_t verdic
     if (session == s_st.session) {
         if (attempt == s_accepted_attempt) {
             ok = verdict == s_accepted_verdict;
-        } else if (s_st.running && !s_st.stop_requested && s_st.mode == 1 &&
+        } else if (s_st.running && !s_st.stop_requested &&
                    s_state == ST_WAIT_VERDICT && s_st.awaiting_verdict &&
                    attempt == s_st.attempt && !s_pending) {
             s_pending_verdict = verdict;
@@ -291,7 +287,7 @@ static void outcome_locked(oracle_t verdict)
 void campaign_poll(void)
 {
     if (!s_mx) return;
-    enum { NONE, EXECUTE, CHECK, RESTORE } action = NONE;
+    enum { NONE, EXECUTE, RESTORE } action = NONE;
     glitch_args_t args;
     uint32_t session = 0, attempt = 0;
     bool report = false;
@@ -327,20 +323,28 @@ void campaign_poll(void)
                 action = EXECUTE;
             }
         } else if (s_state == ST_SETTLE && now >= s_deadline) {
-            if (s_st.mode == 1) {
-                s_state = ST_WAIT_VERDICT;
-                s_st.awaiting_verdict = true;
-                s_deadline = now + MANUAL_TIMEOUT_US;
-                phase_locked("waiting");
-            } else {
-                s_state = ST_CHECKING;
-                phase_locked("checking");
-                action = CHECK;
-            }
+            // The settle interval is the card's own boot window; after it the
+            // shot is only half-fired. Nothing on this board can tell whether the
+            // fuse block moved (docs/UNLOCK_AND_POISON.md §2.4.1: the SMBPBI
+            // endpoint never answered), so the campaign waits for the host.
+            // MANUAL_TIMEOUT_US is the budget for that; nobody answering counts
+            // the shot as timed out and infers no voltage direction.
+            s_state = ST_WAIT_VERDICT;
+            s_st.awaiting_verdict = true;
+            s_deadline = now + MANUAL_TIMEOUT_US;
+            phase_locked("waiting");
         } else if (s_state == ST_WAIT_VERDICT && now >= s_deadline) {
             s_st.awaiting_verdict = false;
             s_st.timeouts++;
-            next_locked();  // No verdict: do not infer a voltage direction.
+            /* 0.5.0: the campaign ends here instead of taking the next coordinate.
+             * Nobody answering no longer means "the human is busy and will get to it";
+             * the agent is the judge and it is a process a human starts, so silence has
+             * exactly one meaning: the side that reads BAR0 is gone. Continuing would
+             * fire a fresh shot every 120 s at a card nobody is looking at -- with the
+             * usual max=60 that is up to two hours of blind fuse attempts, and a
+             * coordinate spent is a coordinate spent. Inferring no voltage direction was
+             * already the rule; this makes the campaign stop drawing coordinates too. */
+            finish_locked("no-judge", false);
         }
         if (s_state == ST_RESTORE) {
             s_state = ST_RESTORING;
@@ -374,16 +378,6 @@ void campaign_poll(void)
             phase_locked("settle");
         }
         xSemaphoreGive(s_mx);
-    } else if (action == CHECK) {
-        bool lost = false;
-        oracle_t verdict = oracle_run_smbpbi(&lost);
-        if (lost) verdict = ORACLE_LOST;
-        xSemaphoreTake(s_mx, portMAX_DELAY);
-        session = s_st.session; attempt = s_st.attempt;
-        outcome_locked(verdict);
-        xSemaphoreGive(s_mx);
-        console_printf("campaign: session=%" PRIu32 " attempt=%" PRIu32 " %s\n",
-                       session, attempt, oracle_name(verdict));
     } else if (action == RESTORE) {
         bool ok = s_restore();
         xSemaphoreTake(s_mx, portMAX_DELAY);
@@ -406,19 +400,19 @@ void campaign_status_json(char *out, int n)
         s = s_st;
         xSemaphoreGive(s_mx);
     }
-    // While idle the reported mode follows @O; an active run is immutable.
-    if (!s.running) s.mode = oracle_get_mode();
+    // The status block is copied under the mutex so a verdict cannot interleave
+    // half-updated counters into /api/status.
     snprintf(out, (size_t)n,
         "{\"running\":%s,\"phase\":\"%s\",\"delay\":%d,\"v_dip\":%d,"
         "\"tries\":%d,\"valid\":%d,\"lost\":%d,\"nack\":%d,\"timeouts\":%d,"
         "\"under\":%d,\"over\":%d,\"hit\":%d,\"goldilocks\":%s,"
-        "\"best_delay\":%d,\"best_v_dip\":%d,\"mode\":%d,"
+        "\"best_delay\":%d,\"best_v_dip\":%d,"
         "\"session\":%" PRIu32 ",\"attempt\":%" PRIu32 ",\"sequence\":%" PRIu32 ","
         "\"awaiting_verdict\":%s,\"stop_requested\":%s,\"restore_ok\":%s}",
         s.running ? "true" : "false", s.phase, s.delay, s.v_dip,
         s.tries, s.valid, s.lost, s.nack, s.timeouts,
         s.under, s.over, s.hit, s.goldilocks ? "true" : "false",
-        s.best_delay, s.best_vdip, s.mode, s.session, s.attempt, s.sequence,
+        s.best_delay, s.best_vdip, s.session, s.attempt, s.sequence,
         s.awaiting_verdict ? "true" : "false",
         s.stop_requested ? "true" : "false", s.restore_ok ? "true" : "false");
 }
@@ -428,5 +422,5 @@ const campaign_cfg_t campaign_defaults = {
     .pulses = 3, .pw = 198, .gap = 150,
     .delays = { 117, 0, 0, 0, 0, 0 }, .ndelays = 1,
     .batch = 5, .min_v = 300, .max_v = 380, .step = 6,
-    .max_attempts = 200, .restore_wait_ms = 300, .oracle_mode = -1,
+    .max_attempts = 200, .restore_wait_ms = 300,
 };

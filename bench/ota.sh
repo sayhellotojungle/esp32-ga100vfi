@@ -60,15 +60,18 @@ if [ -z "${BUILD:-}" ]; then
   echo "[!!] 没有 net.build —— OTA 没生效或刷了不含版本字段的镜像。停在这里，别开火。"
   exit 4
 fi
-case "$EXPECT" in
-  "") ;;
-  *) # 哈希不能直接比对 build 串，但 build 里的编译时刻必须是我们本次构建之后
-     python3 - "$BUILD" <<'PY'
-import datetime, sys
-stamp = sys.argv[1]
-print(f"   [ok] 板子自报：{stamp}")
-PY
-     ;;
+# 只看"有没有 net.build"是不够的：那只能证明板子上有个带版本字段的镜像，不能证明是刚推
+# 的这张。0.5.0 第一次 OTA 就是靠这条差一点被当成成功 —— 上传回 200、板子重启回来自报
+# 0.3.2（旧槽），差别只在版本号。镜像文件名本身就带版本号（esp32-ga100vfi-<版本>-app.bin），
+# 所以拿它当期望值，不必再加一个参数，也不会出现"传了 A 的镜像、按 B 验收"。
+WANT=$(basename "$IMG" | sed -n 's/^esp32-ga100vfi-\([0-9][.0-9]*\)-.*$/\1/p')
+case "$WANT" in
+  "") echo "   [!!] 镜像文件名里没有版本号，跳过版本比对（只做存在性检查）";;
+  *) case "$BUILD" in
+       "$WANT"*) echo "   [ok] 板子自报 $BUILD，与镜像 $WANT 一致";;
+       *) echo "[!!] 板子自报 $BUILD，而镜像是 $WANT —— 刷上去的不是这张（或启动失败回滚）"
+          exit 5;;
+     esac;;
 esac
 
 echo "== 控制器状态（红线 1：只问一句 FUSECTRL）=="

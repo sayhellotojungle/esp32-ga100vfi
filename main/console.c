@@ -21,10 +21,15 @@ static void pump_task(void *arg)
 {
     (void)arg;
     ga_uart_parser_t parser = { 0 };
-    char out[GA_COMMAND_MAX], b[64];
+    /* 一次抽 512 B、空转只睡 2 ms（原来是 64 B 与 10 ms）。Arduino 的预编译 sdkconfig 里没有
+     * CONFIG_ESP_CONSOLE_UART_RX_BUFFER_SIZE，控制台 UART 因此只有硬件 FIFO 那点缓冲（S3 为
+     * 128 B）。0.5.1 在本机实测的行长度台阶：47 B 与 71 B 十发十中、107 B 全中、185 B 中 2、
+     * 257 B 全灭；溢出丢弃之后，尾部字节被当作新的一行起始解析。抽得干净、睡得短是固件侧能为
+     * FIFO 腾出余量的全部手段，更长的行要靠发送方控制长度（见 PORT_NOTES 的 128 B 预算）。 */
+    char out[GA_COMMAND_MAX], b[512];
     for (;;) {
         ssize_t n = read(0, b, sizeof b);
-        if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(n < 0 ? 50 : 10)); continue; }
+        if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(n < 0 ? 50 : 2)); continue; }
         for (ssize_t i = 0; i < n; i++) {
             int ready = ga_uart_feed(&parser, (unsigned char)b[i], out);
             if (ready < 0) console_printf("ERR invalid or overlong command\n");

@@ -52,6 +52,11 @@ BOARD=http://<设备IP> MAX=12 BATCH=2 VD=334 MINV=284 MAXV=384 STEP=25 DELAYS=5
 
 默认波形即档案命中几何：`3 × 222 µs`、`gap 150 µs`、`delay=54`、`td=-40 vr=750 tr=-20`。搜索几何（`VD/MINV/MAXV/STEP/BATCH/MAX/DELAYS`）可以调；波形几何只在 `under`/`over` 判据要求时改，并需留下比档案更强的证据。单发 `pw=15000` @ `vd=300` 按档案定义属 over（欠压横跨整个启动窗），已从默认值移除。
 
+两个用发数换来的坑（`docs/UNLOCK_AND_POISON.md` §2.4.7）：
+
+- **`VD` 必须落在 `MINV..MAXV` 之内**，板子按 `require safe min_v <= vd <= max_v` 校验整个 campaign，而 `MAXV` 默认 **384** —— 只传 `VD=412` 会被整批拒掉（一发未耗，但预检要重跑）。固件的硬范围是 `GLITCH_MIN_MV..GLITCH_MAX_MV = 0..1000`：**380 不是硬件上限，只是 `campaign.c` 的默认上沿与档案约定**。
+- **`PULSES` 与 `PW` 一样决定累计欠压能量，但它不进包络的族键**（族 = `pw × 相位档`）。第三张卡在 `vd=380` 上 `3×222` 两发首发即锁死、`1×222` 两发全活且第二发命中：换 `PULSES` 等于换形状，而包络不会替你拦，族战绩表还会把两种形状算成同一个数。
+
 台账目录名自描述（固件版本 + 波形几何 + 电压），因为跨轮复盘依赖目录名回答"哪版固件、什么波形、几发"。
 
 ### 健康区随机扫（`SWEEP=random`）
@@ -161,10 +166,10 @@ arm 一起被冲掉）。掉链的发＝白烧一发，降白烧率只能靠坐�
 
 1. `tools/deploy_bench.py` 部署前断言 `main/board.h`、`bench/crack.sh` 的 `EXPECT_FW` 默认值、`host/pyproject.toml` 三处版本一致，并断言部署包含 `EXPECT_FW` 闸门；
 2. `ota.sh` 要求镜像 sha 前缀等于 `EXPECT`，刷完回读 `net.build`，字段缺失即退出 4（用法 `BOARD=http://<设备IP> IMG=… EXPECT=<sha前缀> bash bench/ota.sh`）；
-3. `crack.sh` 开火前要求 `net.build` 首词等于 `EXPECT_FW`（当前 `0.4.0`），不等即退出 3。
+3. `crack.sh` 开火前要求 `net.build` 首词等于 `EXPECT_FW`（当前 `0.5.2`），不等即退出 3。
 
 `bench/crack.sh` 的日志目录名取 `build` 首词，因此跨轮台账能回答"这一轮是哪版固件"。绕过闸门（`EXPECT_FW=any`）的代价是这轮日志不可追溯。
 
 `crack.sh` 还有一道**速率闸门**：要求 `/api/status` 的 `board.baud`（实际生效值，不是请求值）等于 `EXPECT_BAUD`（默认 `1000000`），不等即退出 3。波形配方是 1 MHz 的算术（一笔 16 位 PMBus 写 36 µs，档案的 `delay` 就是对着这个宽度标的），总线自己降级到 400/100 kHz 之后每一发的 dip 边沿都被拉长，打出来的判决与台账里前面那些发不是同一个实验。0.4.0 换了 I²C 引脚，这条从"有用"升级成"必查"：接错线、忘接上拉、线太长，第一个症状都是这里降级。降级速率下强行开火用 `EXPECT_BAUD=any`，并在台账里另记实际速率。
 
-当前板端实测（2026-11-21 开火前 `/api/status` 自证）：`net.build = 0.3.2 (Nov 21 2026 13:00:10)`，`baud = 1000000`。0.4.0 换了 I²C 引脚，须先按 [README §4](../README.md) 把 SMBus 线从 47/48 移到 6/7，再 `ota.sh` 刷到 0.4.0；0.3.1/0.3.2 的镜像记录见 [docs/TEST_RESULTS.md](../docs/TEST_RESULTS.md)。
+当前板端实测（2026-11-21 开火前 `/api/status` 自证）：`net.build = 0.3.2 (Nov 21 2026 13:00:10)`，`baud = 1000000`。0.4.0 换了 I²C 引脚，须先按 [README §4](../README.md) 把 SMBus 线移到 6/7，再 `ota.sh` 刷到 0.4.0；0.3.1/0.3.2 的镜像记录见 [docs/TEST_RESULTS.md](../docs/TEST_RESULTS.md)。

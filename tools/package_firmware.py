@@ -81,8 +81,16 @@ def git_state():
     def run(*a):
         return subprocess.run(["git"] + list(a), cwd=ROOT, capture_output=True,
                                text=True).stdout.strip()
+    # `dirty` is a statement about the **inputs**: the sources this image was built from
+    # must match the recorded commit. Two paths are excluded because the release
+    # tooling itself writes them after this point — `firmware/` (the images being
+    # written now; the new ones cannot be committed before they exist) and
+    # `MANIFEST.sha256` (the manifest regenerated right after packaging). Including them
+    # would make the flag permanently true on a re-package and hide the case it exists
+    # for: "someone edited a source and re-packed".
     return {"commit": run("rev-parse", "--short", "HEAD") or None,
-            "dirty": bool(run("status", "--porcelain"))}
+            "dirty": bool(run("status", "--porcelain", "--",
+                              ":(exclude)firmware", ":(exclude)MANIFEST.sha256"))}
 
 
 def package(version, build, out, prune):

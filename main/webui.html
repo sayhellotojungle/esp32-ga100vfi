@@ -12,10 +12,16 @@
 <h1>GA100VFI</h1>
 <section><h2>设备状态</h2><pre id="status">正在连接…</pre><div id="connection" class="hint"></div></section>
 <section>
+<h2>判决方（主机 agent）</h2>
+<pre id="peer">正在连接…</pre>
+<div class="row"><button id="cancel-request" type="button" hidden>撤回开跑请求</button><span id="peer-hint" class="hint"></span></div>
+<p class="hint">板子不判任何东西：能读 BAR0 的只有判决机上的 agent，所以它同时也是唯一有权开跑的一方。本页面把参数和一次「开始」交给它，由它跑完发前闸门再启动战役；请求 10 s 内无人领取即作废，不会在某天agent 上线后自己开打。</p>
+</section>
+<section>
 <h2>自动尝试</h2>
 <form id="campaign-form">
+<p class="hint">点「开始」是递交一次开跑请求，不是直接开火。判决方（或本页的逃生舱按钮）给出判决；一发等不到判决，本轮战役就此结束（`no-judge`），板子既不猜电压方向也不打下一个坐标。</p>
 <div class="grid">
-<label>判决来源<select name="mode"><option value="1">主机 agent / 手动</option><option value="0">SMBPBI（需启用）</option></select></label>
 <label>下探电压 mV<input name="vd" type="number" value="354" min="0" max="1000" required></label>
 <label>下探时间 µs<input name="td" type="number" value="-60" min="-1000000" max="1000000" required></label>
 <label>恢复电压 mV<input name="vr" type="number" value="750" min="0" max="1000" required></label>
@@ -34,11 +40,13 @@
 <div class="row"><button id="start" type="submit">开始</button><button id="stop" type="button">停止并恢复</button><span id="campaign-message" class="notice" role="status"></span></div>
 </form>
 <pre id="campaign-status" class="hint"></pre>
-<div id="manual" class="row" hidden>
-<span>当前轮判决：</span>
+<details id="manual" hidden>
+<summary>逃生舱：人工判决当前这一发</summary>
+<div class="row">
 <button data-verdict="goldilocks">GOLDILOCKS</button><button data-verdict="hit">hit</button><button data-verdict="under">under</button><button data-verdict="over">over</button><button data-verdict="lost">lost</button>
 </div>
-<p class="hint">主机 agent / 手动模式只在当前尝试完成后接收结果。主机上运行 ga100vfi_agent.py，并通过 --bdf 指定显卡。</p>
+<p class="hint">只在判决方没在跑时用：结果按 `session`/`attempt` 交给当前这一轮，过期的轮次会被拒（HTTP 409）。agent 在跑时不要抢它的判决。</p>
+</details>
 </section>
 <section><h2>控制台</h2><pre id="log"></pre><form id="command-form" class="row"><input id="command" maxlength="255" placeholder="v / @C status / g …" aria-label="串口命令" required><button>发送</button></form><div id="command-message" class="notice" role="status"></div></section>
 <section><h2>固件升级</h2><form id="ota-form" class="row"><input type="file" id="firmware" accept=".bin" required aria-label="固件文件"><button id="flash">上传并重启</button></form><div id="ota-message" class="notice" role="status"></div></section>
@@ -58,7 +66,7 @@ async function api(path, options={}) {
   return text;
 }
 function token(c) {
-  return c && c.running && c.mode === 1 && c.awaiting_verdict && c.session > 0 && c.attempt > 0
+  return c && c.running && c.awaiting_verdict && c.session > 0 && c.attempt > 0
     ? {session:c.session, attempt:c.attempt} : null;
 }
 async function poll() {
@@ -72,15 +80,34 @@ async function poll() {
     let text = `运行 ${b.uptime_s}s  启动 #${b.boot}  总线 ${b.baud}Hz  阶段 ${b.phase}\n复位原因：${b.reset}\n网络：${n.sta ? n.ip + '  RSSI ' + n.rssi : 'AP ' + n.ap}`;
     if (b.last) text += `\n上次尝试 #${b.last.seq}  vd=${b.last.vd}mV  写失败=${b.last.wfail}  UV=${b.last.vout_uv}  slip=${b.last.slip_us ?? '-'}µs  reset slip=${b.last.reset_slip_us ?? '-'}µs`;
     $('status').textContent = text;
-    $('campaign-status').textContent = `阶段 ${c.phase}  session ${c.session} / attempt ${c.attempt}  延迟 ${c.delay}µs  电压 ${c.v_dip}mV\n次数 ${c.tries}  有效 ${c.valid}  under ${c.under}  over ${c.over}  hit ${c.hit}  lost ${c.lost}  nack ${c.nack}  timeout ${c.timeouts ?? 0}`;
-    $('start').disabled = c.running;
+    let campaignLine = `阶段 ${c.phase}  session ${c.session} / attempt ${c.attempt}  延迟 ${c.delay}µs  电压 ${c.v_dip}mV\n次数 ${c.tries}  有效 ${c.valid}  under ${c.under}  over ${c.over}  hit ${c.hit}  lost ${c.lost}  nack ${c.nack}  timeout ${c.timeouts ?? 0}`;
+    if (c.phase === 'no-judge') campaignLine += '\n无人判决，战役已结束：剩下的坐标没被打，电压方向也没猜。';
+    $('campaign-status').textContent = campaignLine;
+    const peer = s.peer || {};
+    const labels = {state:'状态', gates:'闸门', next:'下一发', last:'最近判决', ledger:'台账', halt:'停手原因', note:'备注'};
+    let peerLine = peer.present ? `在线，${peer.age_s}s 前收到快照 #${peer.seq}`
+                                : '未运行：判决机上跑 host/ga100vfi_agent.py，经串口连本板';
+    if (peer.info) {
+      for (const [key, value] of Object.entries(peer.info))
+        peerLine += `\n${labels[key] ?? key}：${Array.isArray(value) ? value.join(' ') : value}`;
+    }
+    if (peer.req === 'pending') peerLine += `\n开跑请求 #${peer.req_seq} 等待领取（已等 ${peer.req_age_s}s，10s 后作废）`;
+    else if (peer.req === 'adopted') peerLine += `\n开跑请求 #${peer.req_seq} 已被领取并开跑`;
+    else if (peer.req === 'expired') peerLine += `\n开跑请求 #${peer.req_seq} 过期作废：那时没有判决方在听`;
+    $('peer').textContent = peerLine;
+    const judging = peer.present && peer.age_s >= 0 && peer.age_s <= 5;
+    $('cancel-request').hidden = peer.req !== 'pending';
+    $('start').disabled = c.running || !judging;
     $('stop').disabled = !c.running;
     $('flash').disabled = c.running;
+    $('peer-hint').textContent = judging ? '' :
+      '判决方超过 5 s 没有心跳，「开始」不可用：没人读 BAR0，点了只会等 120 s 然后记一次 timeout。';
     $('manual').hidden = !token(c);
     if (c.goldilocks) message('campaign-message', `GOLDILOCKS：delay=${c.best_delay}µs，vd=${c.best_v_dip}mV`);
     message('connection', '');
   } catch (error) {
     state = null; $('manual').hidden = true;
+    $('peer').textContent = '读不到板子：' + error.message;
     message('connection', '连接失败：' + error.message, true);
   } finally { setTimeout(poll, 1000); }
 }
@@ -106,8 +133,21 @@ async function logs() {
 }
 $('campaign-form').addEventListener('submit', async event => {
   event.preventDefault();
-  const q = new URLSearchParams(new FormData(event.target)); q.set('op','start');
-  try { message('campaign-message', await api('/api/campaign?' + q)); }
+  // 开跑请求是原样交给判决方的，板子不替它解析参数，所以这里也不做百分号编码：
+  // 字段只允许字母、数字与 _=&,.-，越界的字符直接拒在浏览器里，比让判决方猜更诚实。
+  const parts = ['op=start'];
+  for (const [key, value] of new FormData(event.target)) parts.push(`${key}=${value}`);
+  const body = parts.join('&');
+  if (!/^[A-Za-z0-9_=&,.-]+$/.test(body)) {
+    message('campaign-message', '参数里有开跑请求不接受的字符（只允许字母、数字与 _=&,.-）', true);
+    return;
+  }
+  const seq = Math.floor(Date.now() / 1000) % 4000000000 + 1;
+  try { message('campaign-message', `已递交请求 #${seq}：` + await api(`/api/req?${body}&seq=${seq}`)); }
+  catch (error) { message('campaign-message', error.message, true); }
+});
+$('cancel-request').addEventListener('click', async () => {
+  try { message('campaign-message', await api('/api/req?op=cancel')); }
   catch (error) { message('campaign-message', error.message, true); }
 });
 $('stop').addEventListener('click', async () => {

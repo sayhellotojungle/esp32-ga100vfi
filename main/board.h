@@ -45,8 +45,31 @@
  * GA_PEX_MAX_HOLD_MS 会被固件自己放开（忘记的 'j' 和卡死了长得一模一样）。
  * 0.4.0: I²C 引脚改为 GPIO6/7（见下面的接线说明）。波形、时序、遥测字段与 0.3.2 完全
  * 一致，因此 0.3.2 攒下的战绩与标定对本版仍然有效；本版号升 minor 只因为**接线变了**——
- * 拿旧版说明书接线的人会在总线上拿到 NACK，这件事必须从版本号上就能看出来。 */
-#define GA_FW_VERSION "0.4.0"
+ * 拿旧版说明书接线的人会在总线上拿到 NACK，这件事必须从版本号上就能看出来。
+ * 0.4.1: 删除板载 SMBPBI 判决（旧 mode 0）。本台架对该端点的四次读全部无回执
+ * （docs/UNLOCK_AND_POISON.md §2.4.1），板子看不见这颗 GPU；留着这个模式只会让一轮战役
+ * 在"每一发都由一条本板不存在的通路判成 lost"的状态下跑完。波形、时序、遥测与 0.4.0
+ * 一致；对外可见的改动是 `/api/campaign` 不再接受 `mode=0`（`mode=1` 仍接受以便旧脚本
+ * 继续工作）、状态里不再有 `mode` 字段、串口不再有 `@P`/`@O`。
+ * 0.5.0: 板子与判决方（主机 agent）之间的分工与协议定型。行为上只有一处变化：
+ *   - 一发无人判决即结束战役（旧行为是继续打下一个坐标，最多打到 `max`，等于让一张没人
+ *     看过的卡挨最长两小时的盲打）。无人应答只有一个含义：读 BAR0 的那一侧不在了。
+ *   接线自 0.4.0 起不变：I²C 默认引脚仍是 GPIO6/7（见下面的接线说明）。
+ * 新增：串口 `@V`（交判决）与 `@A`（心跳，回包带回页面留下的开跑请求）、`GET /api/req`
+ * （网页递交开跑意图，10 s 无人领取即作废）、`/api/status` 的 `peer` 块。波形、时序与
+ * 其余遥测字段与 0.4.1 一致。
+ * 0.5.1: 修 0.5.0 的自锁——`max_uri_handlers` 用 SDK 默认的 8，而路由已是 9 条，注册失败
+ * 撞上 ESP_ERROR_CHECK 直接 abort，板子反复重启且 HTTP 从不开台。现在表开到 16，注册失败
+ * 只点名那条路由并继续跑：台架上"盒子不说话了"不该是加一条路由的后果。
+ * 0.5.2: 串口命令改为整行分派（含单字符命令）。0.5.1 及之前，`used == 0` 时收到 `r`/`u`/`z`
+ * 之类就当场执行，而判决方心跳是一段 JSON：一行没能完整到达时，载荷里的字母便落在"行首"，本台架
+ * 上实测一行 49 B 的心跳换来 48 行错误，并且 `r` 真的执行了一次 PEX_RST 脉冲（当时那两根线
+ * 没接，所以落在了空处）。现在杂散字节只会是一行错误，永远不会是一个动作。
+ * 心跳的发送预算：一次 write() 不超过 100 B，更长就分块并留 ≥40 ms——这条线的可用速率远低于
+ * 115200 线速（单块 107 B 完整、185 B 几乎全废），测量见 docs/TEST_RESULTS.md。
+ * 注意 GA_BUILD_STAMP 取的是本编译单元的编译时刻，增量构建时它可能停留原地：自证"是不是刚编的
+ * 这一次"要靠 app 哈希，不能只靠这个时间戳。 */
+#define GA_FW_VERSION "0.5.2"
 #define GA_BUILD_STAMP __DATE__ " " __TIME__
 #define GA_BUILD GA_FW_VERSION " (" GA_BUILD_STAMP ")"
 
@@ -54,10 +77,13 @@
 // matrix; card-side 3V3 SMBus pull-ups, 3.3 V pads, direct connection.
 // GPIO6/7: neither is a strapping pin (0/3/45/46), neither is USB D-/D+ (19/20),
 // neither is on the flash bus (26..32) or the octal-PSRAM bus (33..37), and neither
-// drives an onboard peripheral. The previous bench wiring was GPIO47/48, which works
-// but sits on the same pad as the module's onboard WS2812 -- a strip of LED data
-// traffic there looks to the PMBus exactly like a stuck slave. The compile-time
-// checks below are what make "pick any free GPIO" a rule instead of a hope.
+// drives an onboard peripheral. The pair people reach for first, around GPIO48, was
+// avoided for a concrete reason: GPIO48 drives the onboard WS2812 on many ESP32-S3
+// boards, and a strip of LED data traffic there looks to the PMBus exactly like a stuck
+// slave. Our firmware never writes WS2812, so a wrong pair surfaces as a printed
+// degradation, not a silent one. The banner prints these two numbers for the same
+// reason: the mismatch that hurts is firmware expecting one pair while the cables sit
+// in another.
 // Re-wiring changes the bus, not just the pin number: the 1 MHz timing baseline is
 // re-probed at every bring-up (see CHANGELOG 0.3.1), and a bus that cannot answer at
 // 1 MHz degrades with a printed reason -- check the banner says 1000000 Hz before

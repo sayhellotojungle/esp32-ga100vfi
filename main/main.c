@@ -21,7 +21,7 @@
 #include "console.h"
 #include "glitch_plan.h"
 #include "net.h"
-#include "oracle.h"
+#include "peer.h"
 #include "pmbus.h"
 #include "protocol.h"
 
@@ -464,6 +464,47 @@ static void campaign_cmd(const char *args)
     printf(started ? "campaign: started\n" : "ERR campaign busy or invalid config\n");
 }
 
+/* The judge host's side of the console. `@V` runs the same admission test the HTTP route
+ * applies (same tokens, the same campaign function), because a verdict accepted over one
+ * transport and refused over the other would put two meanings on `under`. `@A` is a
+ * heartbeat: it stores the agent's snapshot for the page and hands back whatever start
+ * request the page has left, so the agent never needs a second channel to learn that a
+ * human clicked something.
+ */
+static void peer_cmd(char op, const char *args)
+{
+    char error[96];
+    if (op == 'V') {
+        uint32_t session, attempt;
+        oracle_t verdict;
+        if (!ga_verdict_line(args, &session, &attempt, &verdict, error, sizeof error)) {
+            printf("verdict ERR %s\n", error);
+            return;
+        }
+        if (campaign_submit_verdict(session, attempt, verdict))
+            printf("verdict accepted session=%lu attempt=%lu r=%s\n",
+                   (unsigned long)session, (unsigned long)attempt, oracle_name(verdict));
+        else
+            printf("verdict stale: no shot is waiting for that session/attempt\n");
+        return;
+    }
+    uint32_t seq, adopted;
+    const char *json;
+    if (!ga_agent_frame(args, &seq, &adopted, &json, error, sizeof error) ||
+        !peer_store(json, seq, error, sizeof error)) {
+        printf("peer ERR %s\n", error);
+        return;
+    }
+    if (adopted) peer_adopted(adopted);
+    char req[PEER_REQ_MAX];
+    uint32_t req_seq = 0;
+    if (peer_pending_request(req, sizeof req, &req_seq))
+        printf("peer stored seq=%lu req=%lu %s\n",
+               (unsigned long)seq, (unsigned long)req_seq, req);
+    else
+        printf("peer stored seq=%lu req=none\n", (unsigned long)seq);
+}
+
 static void dispatch(char *line)
 {
     char op = line[0];
@@ -471,6 +512,11 @@ static void dispatch(char *line)
     if (op == '@') { op = line[1]; args = line + 2; }
     while (*args == ' ' || *args == '\t') args++;
     if (line[0] == '@' && op == 'C') { campaign_cmd(args); return; }
+    /* The judge host's two commands are handled before the busy test and without the
+     * hardware lock: a verdict arrives while the campaign holds the bus, and a heartbeat
+     * must answer even mid-shot, because a snapshot that has to wait for the shot to
+     * finish is not evidence that the bench is alive. Neither touches hardware. */
+    if (line[0] == '@' && (op == 'V' || op == 'A')) { peer_cmd(op, args); return; }
     if (campaign_is_running() && !(line[0] != '@' && op == 'v')) {
         printf("ERR campaign busy; stop it before manual hardware commands\n"); return;
     }
@@ -486,12 +532,10 @@ static void dispatch(char *line)
     if (line[0] == '@') {
         switch (op) {
         case 'W': net_wifi_cmd(args); break;
-        case 'P': oracle_probe_print(); break;
-        case 'O': {
-            int mode;
-            if (*args && (!ga_parse_int(args,&mode) || mode < 0 || mode > 1)) printf("ERR oracle mode must be 0 or 1\n");
-            else { if (*args) oracle_set_mode(mode); printf("oracle: %s mode\n",oracle_get_mode()?"manual":"smbpbi"); }
-        } break;
+        // @P (SMBPBI probe) and @O (verdict mode) left with 0.4.1: this bench
+        // never got a reply from the GPU's SMBus endpoint, so there is nothing
+        // to probe and no mode to select. Unknown @ commands fall through to
+        // pmbus_cmd and answer `ERR unknown command`, which is the honest reply.
         default: pmbus_cmd(line + 1); break;  // original text, no last-byte rewrite
         }
     } else switch (op) {
@@ -551,7 +595,9 @@ static void executor_task(void *arg)
     printf("\nesp32-ga100vfi " GA_FW_VERSION ": core1 executor, I2C %d/%d PEX_RST OD@%d bus=%lu Hz reset=software\n",
            PIN_I2C_SDA,PIN_I2C_SCL,PIN_PEX_RST,(unsigned long)pmbus_baud_hz());
     printf("last reset: %s\n",reset_note);
-    printf("commands: v u z g<args> w k K r j J b; @F @s @r @w @q @L @U @x; @W @O @P @C start|stop|status\n");
+    printf("commands: v u z g<args> w k K r j J b; @F @s @r @w @q @L @U @x; @W @C start|stop|status\n");
+    printf("judge host: @V <session> <attempt> <goldilocks|hit|under|over|lost>\n");
+    printf("            @A [seq=N] [adopted=N] {\"ascii\":\"json\"}  (reply carries the page's start request)\n");
     net_init();
     char line[GA_COMMAND_MAX];
     for (;;) {
@@ -570,6 +616,7 @@ void ga_app_main(void)
     ESP_ERROR_CHECK(s_hardware ? ESP_OK : ESP_ERR_NO_MEM);
     console_init();
     campaign_init(board_execute_glitch,board_restore_control);
+    peer_init();   // two RAM slots: the judge host's snapshot and the page's start request
     /* Below esp_timer's priority 22; all hardware driver init happens on core1. */
     ESP_ERROR_CHECK(xTaskCreatePinnedToCore(executor_task,"ga_executor",12288,NULL,
                                           8,NULL,1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);

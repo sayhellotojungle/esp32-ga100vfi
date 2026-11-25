@@ -36,9 +36,10 @@ def main():
     suites = [
         ('planner', ['test/test_glitch_plan.c','main/glitch_plan.c'], [], []),
         ('protocol', ['test/test_protocol.c','main/protocol.c'], [], []),
+        ('peer', ['test/test_peer.c','main/peer.c'], ['test/stubs_campaign'], []),
         ('campaign', ['test/test_campaign.c','main/campaign.c','main/oracle.c','main/glitch_plan.c'],
          ['test/stubs_campaign'], [] if os.name == 'nt' else ['-DCAMPAIGN_TEST_THREADS','-pthread']),
-        ('runtime', ['test/test_main.c','main/protocol.c','main/glitch_plan.c','main/campaign.c','main/oracle.c'],
+        ('runtime', ['test/test_main.c','main/protocol.c','main/glitch_plan.c','main/campaign.c','main/oracle.c','main/peer.c'],
          ['test/stubs_runtime'], []),
         ('console', ['test/test_console.c','main/protocol.c'], ['test/stubs_runtime'], []),
         ('pmbus', ['test/test_pmbus.c','main/glitch_plan.c'], ['test/stubs_peripherals'], []),

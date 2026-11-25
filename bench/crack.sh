@@ -57,7 +57,7 @@ FWTAG=$(printf '%s' "$STATUS_JSON" | \
 # EXPECT_FW 必须与 board.h 同步（tools/deploy_bench.py 在部署时检查三者一致）：
 # host/pyproject.toml、bench/crack.sh、main/board.h。升固件版本时三处一起升，
 # 少升一处就是部署会被闸门挡下 —— 而挡下之后必须有人去修，不能绕过去继续开火。
-EXPECT_FW=${EXPECT_FW:-0.4.0}
+EXPECT_FW=${EXPECT_FW:-0.5.2}
 if [ "$EXPECT_FW" != "any" ] && [ "${FWTAG:-}" != "$EXPECT_FW" ]; then
   echo "[!!] 板子自报固件 = ${FWTAG:-<无 build 字段>}，期望 $EXPECT_FW。"
   echo "     先 BOARD=http://<设备IP> bash bench/ota.sh 刷到本次构建（IMG=… EXPECT=<sha前缀>），再来开火。"
@@ -459,7 +459,13 @@ else
 fi
 
 echo "== 4. 板载 campaign =="
-START="$BOARD/api/campaign?op=start&mode=1&vd=$VD&td=$TD&vr=$VR&tr=$TR&batch=$BATCH"
+# 不带 mode：0.4.1 起板子没有判决模式可言（板载 SMBPBI 判决已删除，本台架读不到那个
+# 端点）。0.4.0 及更早的固件把这个参数当必填，所以只有 EXPECT_FW 闸门保证我们面对的
+# 是哪一版固件之后，才允许改这条 URL —— 版本闸门在这里的作用就是让这类改动不靠记性。
+# 这里走 op=start 直接开跑，而不是页面的 /api/req：本脚本自己就是这一批的发起方，
+# 它拉起来的 agent 用 HTTP 交判决，两边同时在线，没有"没人领取"的可能。/api/req 是给
+# 人的：人在页面上点，得由一个已经在线的判决方当场接手（0.5.0，见 PORT_NOTES）。
+START="$BOARD/api/campaign?op=start&vd=$VD&td=$TD&vr=$VR&tr=$TR&batch=$BATCH"
 START="$START&pw=$PW&gap=$GAP&pulses=$PULSES&wait=$WAIT&step=$STEP&minv=$MINV&maxv=$MAXV"
 START="$START&delays=$DELAYS&max=$MAX"
 echo "     vd 起 $VD，范围 ${MINV}..${MAXV}，步长 $STEP，batch $BATCH，delays=$DELAYS，max=$MAX"

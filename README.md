@@ -1,8 +1,10 @@
-# esp32-ga100vfi 0.4.0
+# esp32-ga100vfi 0.5.1
 
 ESP32-S3 电压毛刺器，用于 NVIDIA GA100 CMP 170HX（`10de:20c2`）的 FF 熔丝解锁。流程固定为四步：毛刺进入 Goldilocks 状态（`DSOV=0` 且 `CRC_STATUS=0x55`）→ 生成 FF 烧写计划 → 交叉验证 → 追加 FF 记录 → 冷启重放。
 
-0.4.0 的接线默认值为 **SDA=GPIO6 / SCL=GPIO7** **PEX_RST=GPIO10**,也可以自行配置修改，但是切记PEX_RST这个**只能下拉与悬空，千万不能拉高**。
+板子不判任何东西：能读 BAR0 的只有插着卡的那台 Linux，因此**每一发的判决只能由主机给出**（0.4.1 删掉了板载 SMBPBI 判决——本台架对该端点四次读全部无回执）。0.5.0 把这条分工写成协议：判决方（主机 agent）经**串口**交判决并以心跳换回页面的开跑请求，网页只负责观测、调参与递交一次「开始」；**一发无人判决即结束本轮战役**，板子既不猜电压方向也不打下一个坐标。接线默认值为 **SDA=GPIO6 / SCL=GPIO7**。熔丝烧写进展见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)：第二张 `10de:20c2` 已按 §1.6 规程烧入 11 条记录（行 301–311）并冷启动复核通过。
+
+本仓库开发卡实测结果：烧入 16 条记录（行 297–312），冷启后 `80 GiB FB / 124 SM / usable_fbp=10`，重扫剩余计划 0 条。
 
 派生自 [dalzyu/pico-ga100vfi](https://github.com/dalzyu/pico-ga100vfi)（RP2350/Pico 实现）：毛刺原理与时序打法承袭上游；固件移植到 ESP32-S3（ESP-IDF / Arduino-ESP32）；主机端工具、HTTP 协议与熔丝烧写规程在本仓库重写。
 
@@ -10,7 +12,7 @@ ESP32-S3 电压毛刺器，用于 NVIDIA GA100 CMP 170HX（`10de:20c2`）的 FF 
 |---|---|---|
 | **ffcalc**（同作者独立仓库） | FF 链分析、烧写计划生成、`verify`/`sim` 交叉验证 | 不可。计划与验证以它为准 |
 | `host/ga100vfi`（本仓库） | 判决链、512 行采集、第二套独立对账、烧写执行 | 不可（本仓库工具与 ffcalc 互为独立实现） |
-| [cmpunlocker](https://github.com/sayhellotojungle/cmpunlocker) | 阶段二/三：驱动层几何显现与 Gen4 重训 | 熔丝之外，与本仓库无关 |
+| [cmpunlocker](https://github.com/amoghmunikote/cmpunlocker) | 阶段二/三：驱动层几何显现与 Gen4 重训 | 熔丝之外，与本仓库无关 |
 
 参考：[kate 的毛刺解锁长文](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/)。
 
@@ -281,16 +283,16 @@ BAR0 偏移，全部实机确认：
 
 | 功能 | GPIO |
 |---|---:|
-| I²C SDA（→ VRM 控制器 MP2888B SMBUS） | 6（0.4.0 默认值） |
-| I²C SCL | 7（0.4.0 默认值） |
+| I²C SDA（→ VRM 控制器 MP2888B SMBUS） | 6 |
+| I²C SCL | 7 |
 | `PEX_RST`，开漏输出 | 10 |
 | UART0 TX / RX（控制台，115200 8N1） | 43 / 44（S3 默认，未重映射） |
 
-选 6/7 的理由：避开 strapping（0/3/45/46）、原生 USB（19/20）、SPI flash（26–32）与 octal flash/PSRAM（33–37），并且不占用多数 S3 板的板载 WS2812（常在 48）。0.3.x 时期本台架接的是 **SDA=47 / SCL=48**，下方实拍即该接线；升到 0.4.0 后按上表重接两根 SMBus 线即可，`PEX_RST` 与串口不动。接线变更后必须核对 `/api/status` 的 `board.baud` 仍为 `1000000`：`bench/crack.sh` 已经把这条做成闸门（`EXPECT_BAUD`），因为波形配方是 1 MHz 的算术，速率降级会让每一发的沿宽与档案不可比。
+选 6/7 的理由：避开 strapping 脚（0/3/45/46）、原生 USB（19/20）、SPI flash（26–32）与 octal flash/PSRAM（33–37），并且不占用多数 ESP32-S3 开发板的板载 WS2812（常在 GPIO48——一段 LED 数据流量在 PMBus 看来正像一个卡死的从机）。任意满足这些条件的引脚对都能用：GPIO 矩阵不在乎，编译期检查会替你在意。全部 112 发战绩、每一份标定与每一个时序数字都取自按上表接线的开发板。**换接线改变的是总线而不只是引脚号**：1 MHz 基线在每次 bring-up 重新探测（见 CHANGELOG 0.3.1），因此接线后必须核对 `/api/status` 的 `board.baud` 仍为 `1000000`——`bench/crack.sh` 已把这条做成闸门（`EXPECT_BAUD`），因为波形配方是 1 MHz 的算术，速率降级会让每一发的沿宽与档案不可比。横幅也打印这两个引脚号：真正伤人的是"固件以为是一对、线在另一对"。
 
 引脚定义集中在 [main/board.h](main/board.h)，改引脚只改这三行。内含编译期检查：0/3/45/46（strapping）、19/20（原生 USB）、26–32（SPI flash）、33–37（octal flash/PSRAM，需 `GA_ALLOW_OCTAL_PINS` 显式放行）一律拒绝；三个角色不得共用一个引脚。若按上表接线后总线读不到 ACK，先查接触与上拉，再怀疑代码：固件不占用其他引脚。
 
-**ESP32-S3 不挑板子：任意 ESP32-S3 开发板按上表接线、刷入固件即可。本仓库开发卡的毛刺板为早前 openUPS 项目遗留模组，非必需规格。SDA/SCL 接插件必须压实：总线"全死"最常见的原因是接触不良。**
+ESP32-S3 不挑板子：任意 ESP32-S3 开发板按上表接线、刷入固件即可。本仓库开发卡的毛刺板为早前 openUPS 项目遗留模组，非必需规格。SDA/SCL 接插件必须压实：总线"全死"最常见的原因是接触不良。
 
 两条硬件不变量：
 
@@ -303,7 +305,7 @@ GND：显卡与毛刺板之间直接接一根 GND 线。经主板/供电共地�
 
 ![焊接点位标注](docs/images/wiring-points.png)
 
-
+![焊接点位原图](docs/images/wiring-points-closeup.png)
 
 ![接线后全图](docs/images/wiring-overview.png)
 
@@ -313,33 +315,39 @@ GND：显卡与毛刺板之间直接接一根 GND 线。经主板/供电共地�
 
 ## 5. 固件、控制台与 HTTP
 
-构建见 [docs/BUILD.md](docs/BUILD.md)。`/api/status` 的 `build` 字段与启动横幅都取 `main/board.h` 的 `GA_FW_VERSION`（当前 `0.4.0`）。证明"板上跑的是哪份镜像"用该字段 + `uptime`（重启后应为个位数秒）。
+构建见 [docs/BUILD.md](docs/BUILD.md)。`/api/status` 的 `build` 字段与启动横幅都取 `main/board.h` 的 `GA_FW_VERSION`（当前 `0.5.0`）。证明"板上跑的是哪份镜像"用该字段 + `uptime`（重启后应为个位数秒）。
 
-BAR0 判决永远在插着目标卡的 Linux 主机本地完成（mmap `/sys/bus/pci/<bdf>/resource0`），ESP32 不搬运 BAR0 数据。控制面有两个等价入口：
+BAR0 判决永远在插着目标卡的 Linux 主机本地完成（mmap `/sys/bus/pci/<bdf>/resource0`），ESP32 不搬运 BAR0 数据。由此得出 0.5.0 的分工：**能判的那一侧就是唯一有权开跑的那一侧**。
 
 | 方式 | 命令通路 | 判决通路 | 适用 |
 |---|---|---|---|
 | A. 串口驱动 `python -m ga100vfi attempt/campaign --port …` | 主机经串口发 `u`/`g`/`w` | 同机打完一发后本地读 BAR0 分类 | 调试、首次打通 |
-| B. 板载 campaign（`mode=1`）+ `host/ga100vfi_agent.py` | 代理与板子纯 HTTP：轮询 `GET /api/status`，提交 `GET /api/verdict?session=&attempt=&r=` | 代理本地读 BAR0 分类，只回传判决词 | 长时间爬山、无串口环境 |
+| B. 板载 campaign + `host/ga100vfi_agent.py` | 代理发 `@C start`；页面经 `GET /api/req` 递交开跑意图 | 代理读 BAR0 分类，经串口 `@V` 或 `GET /api/verdict` 交判决 | 长时间爬山、按批次自动跑 |
+| C. 网页 | 只递交请求与「停止」，不直接开火 | 逃生舱按钮走 `/api/verdict` | 人在旁边看进度、临时手工一发 |
 
-两条路径的判决都绑定 `session+attempt`，过期轮次返回 HTTP 409；代理对未确认结果幂等重试，不为重试重复执行寄存器分类。
+三条路径的判决都绑定 `session+attempt`，过期轮次返回 HTTP 409（串口回 `verdict stale`）；代理对未确认结果幂等重试，不为重试重复执行寄存器分类。板载 campaign 在 settle 之后**必然**进入等待判决状态；等不到判决时，0.5.0 起**结束本轮战役**（`phase":"no-judge"`）而不是打下一个坐标——没人应答只有一个含义：读 BAR0 的那一侧不在了，此时继续打等于让一张没人看过的卡挨盲打。
 
 ```sh
 # A：--port 是 TTL 适配器设备名（Linux 常见 /dev/ttyACM0 或 /dev/ttyUSB0）
 python -m ga100vfi campaign --port <串口> --bdf "$BDF" --adaptive
 # B：<设备IP> 未配网时是 SoftAP 出厂地址 192.168.4.1，配网后换成板子的 LAN 地址
-curl "http://<设备IP>/api/campaign?op=start&mode=1&vd=326&td=-40&vr=750&tr=-20&pw=222&gap=150&pulses=3&delays=54&batch=2&max=12&step=25"
+curl "http://<设备IP>/api/campaign?op=start&vd=326&td=-40&vr=750&tr=-20&pw=222&gap=150&pulses=3&delays=54&batch=2&max=12&step=25"
 sudo python3 host/ga100vfi_agent.py http://<设备IP> --bdf "$BDF"
 ```
 
-| 端点 | 用途 |
+| 端点 / 命令 | 用途 |
 |---|---|
-| `POST /api/cmd`（body=命令行文本） | `u` 解锁 VRM、`w` 回 PWM-VID、`r` PEX_RST 脉冲、`g <参数>` 单发、`c` campaign |
-| `GET /api/status` | 板卡/网络/阶段/看门狗面包屑、`build` |
-| `GET /api/campaign`（`op=start|stop`/查询） | 自适应 campaign：`vd/td/vr/tr/batch/max/minv/maxv/step/pw/gap/pulses/wait/delays/mode` |
+| `POST /api/cmd`（body=命令行文本） | `u` 解锁 VRM、`w` 回 PWM-VID、`r` PEX_RST 脉冲、`g <参数>` 单发、`@C …` campaign |
+| `GET /api/status` | 板卡/网络/阶段/看门狗面包屑、`build`，以及 `peer` 块（判决方在线、快照年龄、开跑请求状态） |
+| `GET /api/campaign`（`op=start|stop`/查询） | 直接开跑或停止：`vd/td/vr/tr/batch/max/minv/maxv/step/pw/gap/pulses/wait/delays` |
+| `GET /api/req`（`op=start&…&seq=N`／`op=cancel`） | 页面递交开跑意图：参数原样交给判决方，板子不解析；10 s 无人领取即作废 |
 | `GET /api/verdict` | 提交判决（携带 `session+attempt`，拒绝旧轮次） |
+| `@V <session> <attempt> <判决词>`（串口） | 同上，走串口；`goldilocks/hit/under/over/lost` 五个词与 HTTP 完全一致 |
+| `@A [seq=N] [adopted=N] {json}`（串口） | 判决方心跳：存快照，回包带回页面留下的开跑请求 |
 | `GET /api/log?pos=` | 滚动日志 |
 | `POST /api/ota` | 固件升级 |
+
+`@A` 的快照必须是一个 ASCII 的 JSON 对象（≤255 B）：控制字段只放代码，中文说明由页面渲染，这样串口丢几个字节会被整块拒收而不是让页面显示半截"健康"。字段词表与串口线格式见 [docs/PORT_NOTES.md](docs/PORT_NOTES.md)。判决方不在线时页面的「开始」不可用——点了也只是等 120 s 然后记一次 `timeout`。
 
 ---
 
@@ -406,7 +414,7 @@ sudo python3 host/ga100vfi_agent.py http://<设备IP> --bdf "$BDF"
 | `host/samples/` | 参考卡快照 + ffcalc 计划（回归样例） |
 | `test/` | 本机 C 回归测试、外设替身、统一测试入口 |
 | `bench/` | 判决机台架脚本（见 bench/README.md） |
-| `tools/` | `sync_arduino.py`、`gen_webui.py`、`deploy_bench.py`、`gen_manifest.py`、`package_firmware.py`、`pack_src_tests.py` |
+| `tools/` | `sync_arduino.py`、`gen_webui.py`、`deploy_bench.py`、`gen_manifest.py`、`package_firmware.py`、`pack_src_tests.py`、`sniff_console.ps1`（Windows 侧抓板子串口控制台） |
 | `docs/` | 构建、架构与时序限制、测试结果、解锁与 poison |
 | `burnplan/` | 本轮解锁的权威证据 |
 | `firmware/` | 本版预编译镜像 |
@@ -435,27 +443,18 @@ python tools/gen_manifest.py                 # 重新生成 MANIFEST.sha256
 python tools/gen_manifest.py --check         # 清单必须覆盖当前跟踪文件
 ```
 
-`firmware/RELEASE.json` 记录版本、镜像内构建串（`X.Y.Z (Mon DD YYYY HH:MM:SS)`，由 `main/board.h` 的 `GA_BUILD_STAMP` 印入）、每个镜像的 sha256、固件源码摘要与构建时的 git 状态。构建串说明"是哪一次编译"，源码摘要说明"输入是哪些文件"；`--check` 用后者拒绝"源码改了但镜像还是旧的"（CRLF 差异不计入摘要，跨平台检出结果一致）。`git` 一栏是打包那一刻的工作树状态：`commit` 是当时的 `HEAD`，`dirty: true` 表示工作树相对该提交有改动，因此镜像不能等同于那次提交——要一份可复现的发布镜像，先提交再打包。
-
-`MANIFEST.sha256` 记录 git 规范化内容的哈希（不含自身），Windows 与 Linux 检出结果一致；新增/改名/删除文件后 `--check` 会点名具体文件。
-
-预编译固件（Arduino-ESP32 3.3.11 / ESP32-S3，Flash 16 MB、OPI PSRAM，构建串 `0.4.0 (Nov 21 2026 16:03:02)`）：
-
-| 文件 | 大小 | sha256 |
-|---|---:|---|
-| `esp32-ga100vfi-0.4.0-app.bin` | 893,920 B | `40272836e797c3ae3ba070527f662c24c69cdb0374e61b2cb4942f0b09f59831` |
-| `esp32-ga100vfi-0.4.0-merged.bin` | 16,777,216 B | `4fd4f012f8db0a5ff304179e12ac119944c747aa6c210d1c2a301126f903992d` |
-
-（`.bin.zip` 内各含一个同名 `.bin`；zip 自身哈希由 `MANIFEST.sha256` 覆盖。打包时 `git` 一栏为 `99c0df3`、`dirty: false`。）
+`firmware/RELEASE.json` 记录版本、镜像内构建串（`X.Y.Z (Mon DD YYYY HH:MM:SS)`，由 `main/board.h` 的 `GA_BUILD_STAMP` 印入）、每个镜像的 sha256、固件源码摘要与构建时的 git 状态。构建串说明"是哪一次编译"，源码摘要说明"输入是哪些文件"；`--check` 用后者拒绝"源码改了但镜像还是旧的"（CRLF 差异不计入摘要，跨平台检出结果一致）。`git` 一栏是打包那一刻的工作树状态：`commit` 是当时的 `HEAD`，`dirty` 只看**输入**——`firmware/`（正在被写的镜像本身）与 `MANIFEST.sha256`（紧接着重生成的清单）不算，否则任何一次重打包都会自证为脏，而这个标志要抓的正是"有人改了源码又顺手重打包"。要一份可复现的发布镜像：先提交，再打包。
 
 - app 镜像用于网页 / `POST /api/ota`；
 - merged 镜像（bootloader + 分区表 + OTAboot + app）用于首次上板整片刷写到偏移 0。
 
 ```sh
-esptool.py --chip esp32s3 -p <串口> -b 921600 write_flash 0x0 esp32-ga100vfi-0.4.0-merged.bin
+esptool.py --chip esp32s3 -p <串口> -b 921600 write_flash 0x0 esp32-ga100vfi-0.5.1-merged.bin
 ```
 
-刷 0.4.0 之前先移线：I²C 默认引脚已从 47/48 改为 6/7（§4）。刷完必须核对 `/api/status` 的 `board.baud` 为 `1000000`。0.3.1 与 0.3.2 的镜像记录见 [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md)。
+串口刷写有一条前置条件是本台架实测出来的：这块板的 USB 串口是 CH340，**没有接 DTR/RTS 自动复位电路**，`esptool` 连不上时报 `Wrong boot mode detected (0x8)`——必须人工把 `BOOT`（GPIO0）拉低再复位一次。板子陷入启动循环时（HTTP 起不来，OTA 也就无从下手），这是唯一的入口。`tools/sniff_console.ps1 -Port <串口> <秒数>` 抓 UART0 控制台：0.5.0 那次"板子不说话了"就是靠它两分钟内定位到 `ESP_ERR_HTTPD_HANDLERS_FULL`，否则只能靠猜。
+
+刷 0.5.1 **不需要移线**：I²C 默认引脚就是 6/7（§4）。刷完必须核对 `/api/status` 的 `board.baud` 为 `1000000`，并核对横幅打印的 `I2C 6/7` 与线在同一对引脚上。0.5.0 起的界面变化：`/api/status` 新增 `peer` 块，页面「开始」改为 `GET /api/req` 递交请求（判决方无心跳时按钮不可用），一发无人判决即结束战役（`phase":"no-judge"`）。0.3.1、0.3.2、0.4.0 与 0.4.1 的镜像记录见 [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md)。
 
 重新出镜像：`python tools/package_firmware.py --prune`（版本取 `main/board.h`，产物名随之变化），然后 `python tools/gen_manifest.py`。
 

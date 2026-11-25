@@ -1,5 +1,5 @@
 // Cooperative campaign controller. Only campaign_poll(), called by the
-// hardware-owner task, may execute an attempt or read the SMBPBI oracle.
+// hardware-owner task, may execute an attempt.
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -16,7 +16,9 @@ typedef struct {
     int min_v, max_v, step;
     int max_attempts;                         // 0 = unlimited; otherwise global cap
     int restore_wait_ms;                      // settle after the attempt's reset
-    int oracle_mode;                          // -1 = current, 0 = SMBPBI, 1 = manual
+    // No verdict source is configured per run: after the settle interval the
+    // campaign always waits for the host (0.4.1 removed the on-board SMBPBI
+    // oracle, which this bench cannot reach).
 } campaign_cfg_t;
 
 typedef bool (*campaign_execute_fn)(const glitch_args_t *args,

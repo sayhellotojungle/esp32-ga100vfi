@@ -8,6 +8,7 @@
 #include <string.h>
 #include "stubs_net/mock_sdk.h"
 #include "../main/net.c"
+#include "../main/peer.c"   /* the handlers under test write into the real slots */
 
 static bool t_busy, t_held, t_reserve_fail, t_running, t_start_ok, t_config_ok;
 static bool t_queue_ok, t_verdict_ok, t_nvs_ok, t_part_exists;
@@ -23,8 +24,18 @@ static campaign_cfg_t t_campaign;
 static const esp_partition_t t_partition = { .size = 1u << 20, .label = "ota_1" };
 static char t_image[65536];
 
+/* The peer slots age by the clock, so the clock has to be a variable here too. */
+static int64_t t_now;
+int64_t esp_timer_get_time(void) { return t_now; }
+
+/* 满表模拟：见下方 httpd_register_uri_handler 的注释。 */
+static int t_reg_limit;
+
 static void reset_fakes(void)
 {
+    t_now = 0;
+    t_reg_limit = 99;
+    peer_init();
     t_busy = t_held = t_reserve_fail = t_running = false;
     t_start_ok = t_config_ok = t_queue_ok = t_verdict_ok = t_nvs_ok = t_part_exists = true;
     t_begin = t_end = t_start = t_queued = t_verdict = t_registered = 0;
@@ -152,9 +163,18 @@ int httpd_resp_send(httpd_req_t *r, const char *body, ssize_t length)
 }
 int httpd_resp_sendstr(httpd_req_t *r, const char *body) { return httpd_resp_send(r, body, -1); }
 int httpd_start(httpd_handle_t *handle, const httpd_config_t *config)
-{ (void)config; *handle = (void *)1; return ESP_OK; }
+{
+    /* 0.5.0 的教训写在这行：SDK 默认只给 8 个 handler 槽，路由加到第 9 条就会注册失败。
+     * 离线模型不跑真 httpd，所以这里把"表必须比路由数大"钉成断言。 */
+    assert(config->max_uri_handlers >= 9);
+    *handle = (void *)1; return ESP_OK;
+}
+/* 满表模拟：0.5.0 就是第 9 条注册失败后直接 abort（板子反复重启、HTTP 从不开），所以这条
+ * 路径必须能离线跑到：表满时板子要活着，并点名是哪条路由没上。 */
 int httpd_register_uri_handler(httpd_handle_t handle, const httpd_uri_t *uri)
-{ (void)handle; assert(uri->handler); t_registered++; return ESP_OK; }
+{ (void)handle; assert(uri->handler);
+  if (t_registered >= t_reg_limit) return ESP_ERR_HTTPD_HANDLERS_FULL;
+  t_registered++; return ESP_OK; }
 
 bool board_is_busy(void) { return t_busy || t_held; }
 bool board_begin_maintenance(void)
@@ -178,7 +198,7 @@ const campaign_cfg_t campaign_defaults = {
     .vd = 354, .td = -60, .vr = 750, .tr = -20, .pulses = 3,
     .pw = 198, .gap = 150, .delays = {117}, .ndelays = 1,
     .batch = 5, .min_v = 300, .max_v = 380, .step = 6,
-    .max_attempts = 200, .restore_wait_ms = 300, .oracle_mode = 1
+    .max_attempts = 200, .restore_wait_ms = 300
 };
 bool campaign_is_running(void) { return t_running; }
 bool campaign_cfg_validate(const campaign_cfg_t *cfg, char *error, size_t n)
@@ -283,14 +303,23 @@ static void test_nvs_reinitializes_after_erasing(void)
 {
     t_nvs_first = ESP_ERR_NVS_NO_FREE_PAGES;
     net_init();
-    assert(t_nvs_init == 2 && t_nvs_erase == 1 && t_registered == 8);
+    /* Nine routes since 0.5.0: the eight that were there plus /api/req. A missing
+     * registration is otherwise invisible offline, and the page would just 404. */
+    assert(t_nvs_init == 2 && t_nvs_erase == 1 && t_registered == 9);
 }
 static void test_campaign_start_reserved_and_parameters_decoded(void)
 {
+    /* 0.4.1: `mode=1` is still accepted so pages and scripts written before the
+     * on-board oracle was deleted keep working; `mode=0` is refused out loud,
+     * before the busy check, instead of starting a run whose shots would all
+     * time out 120 s later. */
+    httpd_req_t deep = request("op=start&mode=0&delays=117", NULL, 0);
+    uri_campaign(&deep); status_is(&deep, "400");
+    assert(t_start == 0 && t_begin == 0 && t_end == 0);
     httpd_req_t r = request("op=start&mode=1&delays=117%2C125&wait=500", NULL, 0);
     uri_campaign(&r); status_is(&r, "200");
     assert(t_start == 1 && t_begin == 1 && t_end == 1 && !t_held);
-    assert(t_campaign.oracle_mode == 1 && t_campaign.restore_wait_ms == 500);
+    assert(t_campaign.restore_wait_ms == 500);
     assert(t_campaign.ndelays == 2 && t_campaign.delays[0] == 117 && t_campaign.delays[1] == 125);
 }
 static void test_campaign_failed_start_releases_reservation(void)
@@ -354,6 +383,64 @@ static void test_ota_success_holds_reservation_until_restart(void)
     assert(t_held && t_end == 0 && t_restart == 1);
 }
 
+static void test_start_request_is_stored_for_the_judge_host(void)
+{
+    httpd_req_t r = request("op=start&vd=340&delays=25,20&seq=11", NULL, 0);
+    assert(uri_req(&r) == ESP_OK);
+    status_is(&r, "200");
+    // /api/status stays lean on purpose: the request body itself is only handed to the
+    // agent over the serial line (test_peer.c proves it arrives unread), because this
+    // response is what every open page re-reads every second on a one-worker server.
+    httpd_req_t s = request(NULL, NULL, 0);
+    uri_status(&s);
+    status_is(&s, "200");
+    assert(strstr(s.response_body, "\"peer\":{") != NULL);
+    assert(strstr(s.response_body, "\"present\":false") != NULL);   // no agent has spoken yet
+    assert(strstr(s.response_body, "\"req\":\"pending\"") != NULL);
+    assert(strstr(s.response_body, "\"req_seq\":11") != NULL);
+
+    char body[PEER_REQ_MAX];
+    uint32_t seq = 0;
+    assert(peer_pending_request(body, sizeof body, &seq) && seq == 11);
+    peer_adopted(11);
+    uri_status(&s);
+    assert(strstr(s.response_body, "\"req\":\"adopted\"") != NULL);
+}
+
+static void test_start_request_refuses_what_it_cannot_honour(void)
+{
+    httpd_req_t r = request("op=start&vd=340", NULL, 0);
+    uri_req(&r); status_is(&r, "400");                 // no sequence: nothing to acknowledge
+    r = request("op=start&ssid=caf%C3%A9&seq=2", NULL, 0);
+    uri_req(&r); status_is(&r, "400");                 // the agent must receive it unchanged
+    r = request("vd=340&op=start&seq=2", NULL, 0);
+    uri_req(&r); status_is(&r, "400");                 // op must lead
+    r = request("op=cancel", NULL, 0);
+    uri_req(&r); status_is(&r, "409");                 // nothing pending to withdraw
+    t_running = true;                                  // a run already going is not a queue
+    r = request("op=start&vd=340&seq=3", NULL, 0);
+    uri_req(&r); status_is(&r, "409");
+    assert(!peer_pending_request(NULL, 0, NULL));      // refused means not stored
+    t_running = false;
+    r = request("op=start&vd=340&seq=4", NULL, 0);
+    uri_req(&r); status_is(&r, "200");
+    r = request("op=cancel", NULL, 0);
+    uri_req(&r); status_is(&r, "200");
+    r = request("op=cancel", NULL, 0);
+    uri_req(&r); status_is(&r, "409");                 // and only once
+}
+
+static void test_full_handler_table_leaves_the_board_alive(void)
+{
+    /* 0.5.0 的真实故障：第 9 条路由注册失败 → ESP_ERROR_CHECK → abort → 反复重启，而台架
+     * 上唯一的症状是"盒子不说话了"。现在表满要活得下来：已注册的路由继续服务，没上的那条
+     * 在控制台点名。 */
+    t_registered = 0;
+    t_reg_limit = 4;
+    net_init();
+    assert(t_registered == 4 && t_restart == 0);
+}
+
 int main(void)
 {
     int count = 0;
@@ -367,11 +454,14 @@ int main(void)
     RUN(test_wifi_full_width_credentials_are_not_truncated);
     RUN(test_wifi_rejects_invalid_password_and_releases_on_save_error);
     RUN(test_nvs_reinitializes_after_erasing);
+    RUN(test_full_handler_table_leaves_the_board_alive);
     RUN(test_campaign_start_reserved_and_parameters_decoded);
     RUN(test_campaign_failed_start_releases_reservation);
     RUN(test_campaign_racing_maintenance_prevents_start);
     RUN(test_bad_campaign_parameter_cannot_default_into_start);
     RUN(test_verdict_ids_and_names_are_strict);
+    RUN(test_start_request_is_stored_for_the_judge_host);
+    RUN(test_start_request_refuses_what_it_cannot_honour);
     RUN(test_ota_busy_does_not_read_or_write);
     RUN(test_ota_failures_always_release_reservation);
     RUN(test_ota_success_holds_reservation_until_restart);

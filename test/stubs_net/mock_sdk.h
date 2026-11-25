@@ -12,6 +12,7 @@ typedef int esp_err_t;
 #define ESP_ERR_INVALID_STATE 0x101
 #define ESP_ERR_NOT_FOUND 0x102
 #define ESP_ERR_HTTPD_RESULT_TRUNC 0x103
+#define ESP_ERR_HTTPD_HANDLERS_FULL 0xb001
 #define ESP_ERR_NVS_NOT_FOUND 0x104
 #define ESP_ERR_NVS_NO_FREE_PAGES 0x105
 #define ESP_ERR_NVS_NEW_VERSION_FOUND 0x106
@@ -89,7 +90,7 @@ typedef struct httpd_req {
     bool connection_close;
 } httpd_req_t;
 typedef void *httpd_handle_t;
-typedef struct { int task_priority, stack_size, core_id; bool lru_purge_enable; } httpd_config_t;
+typedef struct { int task_priority, stack_size, core_id, max_uri_handlers; bool lru_purge_enable; } httpd_config_t;
 #define HTTPD_DEFAULT_CONFIG() ((httpd_config_t){0})
 #define HTTP_GET 0
 #define HTTP_POST 1
