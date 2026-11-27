@@ -20,6 +20,21 @@
 #define PEER_INFO_MAX   256                 /* agent -> page: one ASCII JSON object */
 #define PEER_REQ_MAX    192                 /* page -> agent: the request verbatim  */
 #define PEER_REQ_TTL_US INT64_C(10000000)   /* 10 s: after that the click is void   */
+/* How long a heartbeat counts as "the judge is here". This number lives **here** and
+ * nowhere else: the 0.5.6 page keyed its own `age_s <= 5` test, and a second copy of a
+ * window on the client is exactly how the two sides drift apart. The agent sends at
+ * 1 Hz (`VerdictAgent.PEER_EVERY_S`), which is five times inside this.
+ *
+ * Why the field needs it at all: the store flag in `peer.c` (`s_present`) latches on the
+ * first `@A` and never
+ * falls, so before 0.5.7 a board that had lost its judge kept answering
+ * `{"present":true,"age_s":6}` -- and the page, reading `present`, reported an agent
+ * that had been dead for minutes as 在线. Measured on the bench 2026-11-26 right after
+ * the heartbeat landed: kill the process, and six seconds later presence was still
+ * true. Presence is a claim about elapsed time, so it has to be computed from the age,
+ * not latched. The snapshot itself (`seq`/`info`) stays latched: a judge that died is
+ * precisely the moment its `halt` reason matters. */
+#define PEER_STALE_US   INT64_C(5000000)    /* 5 s without `@A`: the judge is gone     */
 
 void peer_init(void);
 

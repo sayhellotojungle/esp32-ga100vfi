@@ -7,12 +7,12 @@
 option_words/info/ff_rows，不写 fingerprint —— 于是 `ffcalc verify` 直接
 `FAIL: plan has no uuid/fingerprint; re-generate it`。那不是卡不对，是快照没身份。
 上一张卡（0.3.0）用的是 ffprobe.ko + `ffcalc ingest` 的快照，ingest 会算 fingerprint，
-verify 以 "belongs to card GPU-<fingerprint>" 通过（burnplan/ffcalc-verify.txt）。
+verify 以 "belongs to card GPU-<fingerprint>" 通过（0.3.0 实机验证过）。
 本工具在 capture 路径上做同一件事。
 
 红线：fingerprint 是 `*_DEFECTIVE` 全字 + SBFE 位的烧写不变哈希，只能证明"烧前烧后是
 同一块 die"，**不能证明这是哪一张卡**——同批次卡的 defective 相同、出厂 SBFE 可为 1，
-指纹可与他人卡相同（README §1.5）。所以补完之后仍然必须：512 行两次独立读一致、
+指纹可与他人卡相同（README §2.5）。所以补完之后仍然必须：512 行两次独立读一致、
 `ga100vfi.burn crosscheck` 现场逐行回读目标行。UUID 通道一旦可用（装了驱动），
 必须回到 UUID 认卡。
 

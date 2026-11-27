@@ -92,7 +92,8 @@ def run_suite(workdir: Path):
 
 def main():
     before = sha(HOST / AGENT)
-    work = Path(tempfile.mkdtemp(prefix="ga100vfi-mutcheck-read-"))   # 系统临时目录：不写死任何一台机器的路径
+    work = Path(tempfile.mkdtemp(prefix="ga100vfi-mutcheck-read-",
+                                 dir=r"C:\Users\jungle\AppData\Local\Temp\opencode"))
     try:
         host_copy = work / "host"
         shutil.copytree(HOST, host_copy, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))

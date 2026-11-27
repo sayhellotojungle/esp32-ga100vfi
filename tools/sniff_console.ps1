@@ -1,9 +1,7 @@
-param([Parameter(Mandatory = $true)][string]$Port, [int]$Seconds = 10, [int]$Baud = 115200, [switch]$Reset)
+param([int]$Seconds = 10, [int]$Baud = 115200, [switch]$Reset)
 # One-shot console sniffer: CH340 -> board UART0, 115200 8N1.
-# The port has no default on purpose: a hard-coded COMx is one machine's wiring, and
-# sniffing the wrong port just returns silence that looks like a dead board.
 $sp = New-Object System.IO.Ports.SerialPort
-$sp.PortName = $Port
+$sp.PortName = 'COM5'
 $sp.BaudRate = $Baud
 $sp.Parity = 'None'
 $sp.DataBits = 8

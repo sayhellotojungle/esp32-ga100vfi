@@ -607,3 +607,30 @@ class History(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class CodeGrid(unittest.TestCase):
+    """坐标的真实单位是 PMBus 码，不是 mV。与 test/test_glitch_plan.c::test_code_grid 钉同一张表。
+
+    VOUT_COMMAND 的 LSB 是 6.25 mV：366/368/370 是同一个码 59，372/374/376/378 是同一个码 60。
+    11-21 那次命中的 372→370→368→366 阶梯因此有三发是重复；而 300..380 这段合法带只有 14 个坐标。
+    host 与固件各有一份取整实现（envelope.mv_to_code / glitch_plan.c 的 mv_to_code）：两边钉同一张
+    表，是防止其中一份被"顺手改成 mV 刻度"的唯一闸门。
+    """
+
+    def test_the_ladder_table(self):
+        for mv in (366, 368, 370):
+            self.assertEqual(env.mv_to_code(mv), 59, f"{mv} 与 366 必须是同一个码")
+        for mv in (372, 374, 376, 378):
+            self.assertEqual(env.mv_to_code(mv), 60, f"{mv} 与 372 必须是同一个码")
+        self.assertEqual(env.mv_to_code(380), 61)
+        self.assertEqual(env.mv_to_code(380) - env.mv_to_code(300), 13)   # 全带只有 14 个坐标
+
+    def test_code_to_mv_round_trips(self):
+        # 梯子把位置存成 mV 的前提：码→mV→码 必须回到原码（0..160 = 整个合法量程）。
+        for code in range(0, 161):
+            self.assertEqual(env.mv_to_code(env.code_to_mv(code)), code)
+
+    def test_one_code_is_one_physical_shot(self):
+        self.assertEqual(env.mv_to_code(372), env.mv_to_code(375))
+        self.assertEqual(env.code_to_mv(60), 375)

@@ -3,6 +3,7 @@ import contextlib
 import inspect
 import io
 import json
+import re
 import sys
 import unittest
 import urllib.error
@@ -10,7 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ga100vfi import classify as classify_module, cli, glitch
+from ga100vfi import classify as classify_module, cli, glitch, shot_policy
 from ga100vfi.classify import UNREADABLE, Verdict, attempt_outcome
 import ga100vfi_agent as agent_module
 from ga100vfi_agent import VerdictAgent, awaiting_token
@@ -396,7 +397,12 @@ class AgentDelivery(unittest.TestCase):
     def agent(self, state=None):
         # first_read_delay=0：这个量是给真卡留的启动静默，测试里不该付那 2 秒（整份套件本来
         # 0.2 s 跑完）。它自己的那条测试把它设回 2.0 来验证真的会等。
-        agent = VerdictAgent('http://example.invalid', '0000:01:00.0', first_read_delay=0)
+        # max_bar0_sessions=2：这一组测的是【盖章判决】那条通路 —— 复核一次就要再花一次会话
+        # （第一次读 + 一次复读），预算 1 的代理根本走不到复核，测试会退化成"永远未盖章"。
+        # hunt 阶段导出 1 是【省发数】的有意例外，由 test_找区间阶段每发必须真读一次 与下面那条
+        # 单会话不盖章的测试单独钉住。
+        agent = VerdictAgent('http://example.invalid', '0000:01:00.0', first_read_delay=0,
+                             max_bar0_sessions=2)
         agent.status = Mock(return_value=state or waiting())
         agent.gpu_verdict = Mock(return_value='hit')
         agent.feed = Mock()
@@ -445,19 +451,126 @@ class AgentDelivery(unittest.TestCase):
     def test_first_read_delay_lets_the_card_boot_before_we_read(self):
         # 操作员 2026-11-20 的要求：打完过一会儿再读。板子的 settle 已经等过 restore_wait_ms，
         # 这一段是给卡自己的启动窗留的额外余量（熔丝块读会干扰启动 = 红线 1）。
+        # 0.5.5 把这一次长睡换成 0.25 s 一跳的谓词轮询（下限不变），所以这里断言的不再是"睡过
+        # 一次 2.0"，而是它真正要保证的那件事：**下限之内一枪 BAR0 都不许开**。
         agent = self.agent(waiting(session=11, attempt=8))
         agent.first_read_delay = 2.0
-        slept = []
-        agent.gpu_verdict = Mock(return_value='under')
-        with patch.object(agent_module.time, "sleep", lambda s: slept.append(s)), \
+        clock = {"t": 0.0}
+        slept, reads_at = [], []
+
+        def fake_sleep(s):
+            slept.append(s)
+            clock["t"] += s
+
+        def fake_verdict():
+            reads_at.append(clock["t"])
+            # 健康基线读数：按 _needs_confirm 的规矩，基线不追加第二次会话
+            agent.last_regs = {"FUSECTRL": 0xE0040000, "DSOV": 1, "CRC": 0x55,
+                               "PRIV": 0x1E, "FPF": 0xFFFFFFFF}
+            return "under"
+
+        agent.gpu_verdict = Mock(side_effect=fake_verdict)
+        with patch.object(agent_module.time, "sleep", fake_sleep), \
+             patch.object(agent_module.time, "monotonic", lambda: clock["t"]), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(agent.evaluate((11, 8)), 'under')
-        self.assertIn(2.0, slept)
-        self.assertLess(len(slept), 3)              # 不是过去那种 15×2 s 的重读
+        self.assertGreaterEqual(sum(slept), 2.0)              # 静默下限等满了
+        self.assertGreaterEqual(reads_at[0], 2.0)             # 下限之内没有开读
+        self.assertEqual(len(reads_at), 1)                     # 基线不复核
+        self.assertEqual(agent.reads, 1)
+        self.assertTrue(agent.stable)                          # 基线：按规矩不查也算盖了章
+
+    def test_a_moving_reading_is_re_read_and_the_alarm_wins(self):
+        """脏读与真反应长得一样，只有一次复核能分开它们；不一致时取更报警的那份。
+
+        11-25 那 40 发里约 1/3 的 CRC 读成 0x57/0x75（该是 0x55）。单发单读时"我们读早了"与
+        "卡真的动了"完全同形，而这两个判决的处置相反（前者继续打、后者立刻停火并冻坐标）。
+        """
+        agent = self.agent(waiting(session=11, attempt=12))
+        agent.budget_s, agent.poll_s, agent.stable_s = 0.05, 0.001, 0
+        agent.present = Mock(return_value=True)
+        readings = [{"FUSECTRL": 0xE0040000, "DSOV": 1, "CRC": 0x57, "PRIV": 0x1E,
+                     "FPF": 0xFFFFFFFF},        # 第一次：CRC 脏
+                    {"FUSECTRL": 0xE0040000, "DSOV": 0, "CRC": 0x55, "PRIV": 0x1E,
+                     "FPF": 0xFFFFFFFF}]        # 第二次：DSOV 离开基线 = 反应
+        agent.gpu_verdict = Mock(side_effect=lambda: (
+            agent.last_regs.update(readings[min(agent.gpu_verdict.call_count - 1, 1)]),
+            "under" if agent.gpu_verdict.call_count == 1 else "over")[1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            verdict = agent.evaluate((11, 12))
+        self.assertEqual(agent.gpu_verdict.call_count, 2)      # 非基线 → 复核一次
+        self.assertFalse(agent.stable)
+        self.assertEqual(verdict, "over")                      # 报警的那一份胜出
+        self.assertEqual(agent.last_regs["DSOV"], 0)
+
+    def test_a_clean_repeat_is_stamped_stable(self):
+        agent = self.agent(waiting(session=11, attempt=13))
+        agent.budget_s, agent.poll_s, agent.stable_s = 0.05, 0.001, 0
+        agent.present = Mock(return_value=True)
+        regs = {"FUSECTRL": 0xE0040000, "DSOV": 1, "CRC": 0x57, "PRIV": 0x1E,
+                "FPF": 0xFFFFFFFF}
+        agent.gpu_verdict = Mock(side_effect=lambda: (
+            agent.last_regs.update(regs), "under")[1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agent.evaluate((11, 13)), "under")
+        self.assertEqual(agent.gpu_verdict.call_count, 2)
+        self.assertTrue(agent.stable)
+
+    def test_单会话预算下脏读只能判不能盖章(self):
+        """hunt 每发的设置是【一次会话、一次读】(BAR0_SESSIONS=1 / CONFIRM_READS=1)：够分 under/over，
+        但**天生盖不了章** —— 这正是"命中判据必须交给批末那次单独读"的代码落点。
+
+        2026-11-26 把 bar0_sessions 压到 1 是为了多买几发（每碰一次卡一次，死亡时刻就往前挪一次），
+        代价必须写死在测试里：脏读（CRC=0x57 ≠ 健康的 0x55）也不许偷偷开第二次会话去复核 —— 那正是
+        2026-11-20 一发 lost 里 15 次会话把整机拖死的形状（红线 1）。它只能明着承认"这一发没盖章"。
+        """
+        agent = self.agent(waiting(session=11, attempt=15))
+        agent.max_bar0_sessions, agent.confirm_reads = 1, 1
+        agent.budget_s, agent.poll_s, agent.stable_s = 0.05, 0.001, 0
+        agent.present = Mock(return_value=True)
+        regs = {"FUSECTRL": 0xE0040000, "DSOV": 1, "CRC": 0x57, "PRIV": 0x1E, "FPF": 0xFFFFFFFF}
+        agent.gpu_verdict = Mock(side_effect=lambda: (agent.last_regs.update(regs), "under")[1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agent.evaluate((11, 15)), "under")
+        self.assertEqual(agent.gpu_verdict.call_count, 1, "会话预算 1 却开出第二次会话 = 红线 1")
+        self.assertFalse(agent.stable, "hunt 的 1/1 设置下这发就是未盖章：说成盖章会骗我们去找不存在的章")
+
+    def test_a_dying_shot_never_gets_a_second_bar0_session(self):
+        # 复核是给"读到了东西而且不像基线"准备的；卡正在离开总线时追加 BAR0，正是 2026-11-20
+        # 那一发 lost 里 15 次会话把整机拖死的形状（红线 1）。宁可这一发没有判决。
+        agent = self.agent(waiting(session=11, attempt=14))
+        agent.budget_s, agent.poll_s = 0.05, 0.001
+        agent.present = Mock(return_value=True)
+        agent.gpu_verdict = Mock(return_value='lost')          # 熔丝块没读到
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agent.evaluate((11, 14)), 'lost')
+        self.assertEqual(agent.gpu_verdict.call_count, 1)
+        self.assertIsNone(agent.stable)                        # 没盖章，也没假称盖过
+
+    def test_shot_tags_carry_the_physical_code(self):
+        # 台账按 mV 索引，而 6.25 mV 才是 LSB：372 与 375 是同一个码 60。判决行里没有 code 时,
+        # 两批"不同的电压"其实可能是同一发 —— 11-21 那条 2 mV 阶梯就是这么打了三发同一坐标。
+        agent = self.agent()
+        self.assertIn("code=60(375mV)", agent.shot_tags({"v_dip": 372}))
+        self.assertIn("code=60", agent.shot_tags({"v_dip": 375, "v_code": 60}))
+        self.assertNotIn("(375mV)", agent.shot_tags({"v_dip": 375, "v_code": 60}))
+        self.assertIn("codes=14", agent.shot_tags({"v_dip": 372, "v_code": 60,
+                                                   "codes_tried": 14}))
+        agent.t_cfg_s, agent.t_bar0_s, agent.stable = 1.4, 4.0, False
+        tags = agent.shot_tags({"v_dip": 372})
+        self.assertIn("t_cfg=1.4s", tags)
+        self.assertIn("t_bar0=4.0s", tags)
+        self.assertIn("stable=NO", tags)                       # 没盖章的那几行必须自己说明
 
     def test_read_gating_defaults_are_the_safe_ones(self):
+        # 数值本身不再在这里钉 —— 它只有一个出处（shot_policy，见 ShotPolicy 那组）。这里钉的是这条
+        # 数**不许退化成 0**：2 s 时本卡同一族 55 发里有 31 发把 CRC 读脏，静默下限是本台的保护量。
         agent = VerdictAgent('http://example.invalid', '0000:00:00.0')
-        self.assertEqual((agent.first_read_delay, agent.max_bar0_sessions), (2.0, 2))
+        self.assertEqual(agent.first_read_delay, shot_policy.get('first_read_delay_s'),
+                         "代理又有了自己的第二个默认值")
+        self.assertGreaterEqual(agent.first_read_delay, 2.0,
+                                "首次读的静默下限被调到保护量以下（红线 1）")
+        self.assertGreaterEqual(agent.max_bar0_sessions, 0)
         self.assertLess(agent.budget_s, 120)        # 必须短于固件的 MANUAL_TIMEOUT_US(120 s)
 
     def test_retry_keeps_result_and_does_not_reclassify(self):
@@ -623,7 +736,7 @@ class AgentDelivery(unittest.TestCase):
         # campaign_poll() call, so the stop has to be asked for *before* the verdict is
         # delivered. Measured on the second card (2026-11-20): with the stop after the
         # feed, every "lost" round came back tries=2 — one judged shot plus one that
-        # nobody ever judged. The archive rule is 一发 lost 即停火 (§2.4 规则 2).
+        # nobody ever judged. The archive rule is 一发 lost 即停火 (docs/UNLOCK_AND_POISON.md §四).
         agent, calls = self.lost_agent()
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertTrue(agent.step())
@@ -1024,6 +1137,97 @@ class BenchFlowScriptShape(unittest.TestCase):
         text = (cls.dir / name).read_text(encoding="utf-8")
         return "\n".join(l for l in text.splitlines() if not l.strip().startswith("#"))
 
+    def test_early_sh_reads_row18_without_ever_becoming_a_writer(self):
+        """early 档是**读**相位刻度，不是第二个烧写路径。
+
+        它开的是本台架唯一造成过整机死机的通路（BAR0），所以三条必须钉住：在场判断排在 capture
+        之前（红线 1）；基线按卡身份分文件（换卡不许拿别人的 row 18 当参照）；脚本里不许出现任何
+        写动作。
+        """
+        code = self.src("early.sh")
+        self.assertLess(code.find("present ||"), code.find("capture -o"),
+                        "卡不在场时一个 BAR0 都不开：在场判断必须排在 capture 前面")
+        self.assertIn("ff-baseline-", code)
+        self.assertIn("card_key", code)
+        for banned in ("CMD_PROGRAM", "burn plan", "arm", " wake"):
+            self.assertNotIn(banned, code, f"early.sh 里出现了写动作 {banned!r}")
+        # `burn.py capture` 是按 -o 的后缀决定写 JSON 还是 rows.txt 的：后缀错了不会报错，
+        # 只会静默落成文本，然后读的一方 json.load 报 "Extra data" —— 症状像"卡不配合"。
+        import re as _re
+        for arg in _re.findall(r'capture -o "([^"]+)"', code):
+            self.assertTrue(arg.endswith(".json"),
+                            f"{arg}: capture 的 -o 后缀不是 .json（临时名也要以 .json 结尾）")
+
+    def test_early_sh_compare_reports_the_real_reason_when_the_card_is_gone(self):
+        """批末卡死了，early 档要说"卡已离链"，不能说"没有基线"。
+
+        2026-11-26 05:18 那批真踩到了：`compare` 用**当时**算出的卡身份去找基线，而卡已死 → 身份
+        算不出 → `key=unknown` → 报"本电源周期没有本卡基线"，可基线（487 行）就躺在 `state/` 里。
+        两条都判 `nojudge`，但下一步完全不同：一条要你去补基线，另一条就是那一发的现场结论。
+        所以来源与顺序都要钉住：基线路径先按 `baseline` 那一步写下的指针；在场判断排在报"没基线"
+        之前（卡不在了，先说这个）。
+        """
+        code = self.src("early.sh")
+        self.assertIn('"$STATE/current"', code, "baseline 要把基线路径写成指针")
+        self.assertLess(code.find('"$STATE/current"'), code.find("card_key 2>/dev/null"),
+                        "compare 必须先读指针，卡死了才算身份（算不出来就别拿它当结论）")
+        self.assertLess(code.find("批末卡已离链"), code.find("本电源周期没有本卡基线"),
+                        "卡离链这句要排在「没基线」前面，否则死卡的那批永远报成「忘了抓基线」")
+
+    def test_prefire_blanket_sleep_is_two_seconds_not_twentyfive(self):
+        """开火前那段静置的默认值必须是 2 s（2026-11-26 操作员指令），不许悄悄爬回 25。
+
+        这段静置的历史理由（"冷上电第一发剖面是歪的"）现在由两个东西接管：预热发负责吸收冷态第一发，
+        `stretch_us` 负责把冷偏**量出来**。既然能量出来，就不该再用一个没测过的固定余量去盖它 —— 尤其
+        是一个电源周期只买得到 2 发的时候，25 s/周期是纯税。测试钉的是默认值，不是那句注释。
+        """
+        code = self.src("crack.sh")
+        self.assertIn("CARD_SETTLE_S=${CARD_SETTLE_S:-$(SP card_settle_s)}", code,
+                      "开火前静置不再从规程取值：它会变成第 6 个出处（那是 CARD_SETTLE_S=2 被入口层"
+                      "写死的 25 盖掉那一天的形状）")
+        self.assertEqual(2, shot_policy.get("card_settle_s"),
+                         "静置默认值不再是 2 s：那意味着每批又多交 23 s 的税")
+        self.assertNotIn("CARD_SETTLE_S=25", code, "25 s 那个没测过的余量又爬回来了")
+        self.assertIn('sleep "$CARD_SETTLE_S"', code, "静置还是得真的 sleep（谓词门是另一件事）")
+
+    def test_the_firing_path_still_never_opens_bar0_before_the_shot(self):
+        """0.5.9 加了 early 档，但**没有**把它塞进发前路径：那是 11-21 两次"板子一发没打、
+        判决机却挂了"的形状。基线由人（或 r_go 那类体检脚本）在卡健康时抓一次。"""
+        code = self.src("crack.sh")
+        self.assertNotIn("early.sh", code.split("== 2.9")[0],
+                         "发前路径里出现了 early.sh：发前一次 BAR0 都不开")
+
+    def test_实发数与判决数对不上时必须补记(self):
+        """板子 tries 比台账行数多出来的那些发，要在批末补成 `nojudge` 行。
+
+        2026-11-26：tries=7、判决 6、`顺序` 里 6 行 —— 台账上"打过 6 发"是假的，实际打了 7 发。
+        少记那一发不只是数字难看：它正是"打过没人判还继续打"那个档案形状（lost 之后补一发）的第一手证据。
+        """
+        code = self.src("crack.sh")
+        self.assertIn("board_tries > len(rows)", code, "批末不再核对【板子发数 vs 判决行数】")
+        self.assertIn('"nojudge"', code, "补记的判决词必须与代理那侧同名，台账才只有一种词表")
+        self.assertIn("nojdg", code, "跨轮总表要有 nojudge 那一列，否则补记的行只进合计、看不出是哪一发")
+
+    def test_revive_sh_pulses_reset_only_when_nothing_is_being_judged(self):
+        """卡离链后的救援：允许花一次 PERST 脉冲，但不许在判决进行中拉复位，也不许碰 BAR0。
+
+        顺序就是这条测试的全部内容：战役检查排在 `k` 之前。反过来的话，救援会把正在判决的那一发
+        弄成假 `lost` —— 那是往台账里注水。
+        """
+        code = self.src("revive.sh")
+        self.assertLess(code.find("战役"), code.find('"$CON" k'),
+                        "战役是否在跑的检查必须排在 PERST 脉冲之前")
+        self.assertNotIn("burn.py", code.replace("ga100vfi.burn", "burn.py"))
+        self.assertIn("rescan", code)
+        self.assertIn("exit 4", code, "请不回来要给出可区分的退码（=该断电了，不是失败了）")
+        # 脉冲是否落地必须有凭证：第一次跑这一步我把 `timeout 20` 套在 console.sh 外面，拿到 124
+        # 就当"叫不回"，而 124 只是超时被我设进了 console.sh 的重试预算里。所以既要认板子的
+        # `released`，也要把超时按 console.sh 的预算算出来，两个都得在代码里。
+        self.assertIn("CON_GREP=released", code, "'k' 的答复判据必须是 released，否则脉冲落地无凭证")
+        self.assertLessEqual(code.find("BUDGET=$(("), code.find('timeout "$BUDGET"'),
+                             "给 console.sh 的超时必须由预算算出来，不能拍脑袋")
+        self.assertIn("exit 5", code, "脉冲未证实要单独一个退码（≠卡叫不回）")
+
     def test_burn_sh_gates_in_order(self):
         code = self.src("burn.sh")
         at = {k: code.find(k) for k in (
@@ -1039,8 +1243,14 @@ class BenchFlowScriptShape(unittest.TestCase):
         self.assertLess(at["goldilocks window: OPEN"], at['burn "$SNAP" "$PLAN" --rows'],
                         "不在窗口里不许 PROGRAM")
         self.assertLess(at["crosscheck"], at['burn "$SNAP" "$PLAN" --rows'])
-        self.assertLess(at['burn "$SNAP" "$PLAN" --rows'], at["diffrows"],
-                        "每次真写之后都必须独立重读逐行核对")
+        # 每次真写之后都必须独立重读逐行核对。**不能**比 `burn …` 与 `diffrows` 两个 token 的首次
+        # 出现位置：核对逻辑收在 `snapdiff()` 这个函数里，函数体在文件前半部，按位置比会把这条
+        # 判据误判成"顺序倒了"（2026-11-26 踩到）。逐次检查才对：每一次真写之后必须跟一次核对。
+        writes = [m.start() for m in re.finditer(r'-m ga100vfi\.burn --bdf "\$BDF" burn ', code)]
+        self.assertEqual(2, len(writes), "试烧与续烧这两次真写都要在脚本里")
+        for i, w in enumerate(writes, 1):
+            self.assertGreater(code.find("snapdiff", w), 0,
+                               f"第 {i} 次真写之后没有独立重读逐行核对")
         self.assertIn("read -r", code, "不可逆操作前必须有人确认，脚本不许自己往下烧")
         self.assertIn("结论：只有计划内的行按记录改变", code,
                       "核对判据必须是『只改了计划内的行』，不是『我改的那几行变了』")
@@ -1061,6 +1271,39 @@ class BenchFlowScriptShape(unittest.TestCase):
         self.assertIn('get("board",{}).get("baud"', code,
                       "必须取 board.baud（实际生效值），取 net 里的请求值等于没检查")
 
+    def test_crack_sh_prewarm_shot_is_judged_and_gates_the_batch(self):
+        """预热发打的就是本批坐标 —— 它**必须**被判决，而且它的判决是开正式批的闸门。
+
+        第一版设计是"排在代理起来之前，天然没人判"，写完即推翻：万一那一发就是唯一一次命中，
+        没人判 = 交给超时 = 拿命中换一批 under。这里钉四条，防止有人为了省 20 s 把闸门拆回去：
+          1) 预热有自己的代理与自己的日志（正式批的 agent.log / 坐标清点必须干净）；
+          2) 波形逐参数等于正式批，尤其是 `wait=$WAIT`（settle 缩短就不是在预热同一个状态）；
+          3) 只有判决 `under` 才继续；
+          4) 这一段绝不按 PEX_RST（真命中之后按一下就是把熔丝链重放一遍）。
+        """
+        code = self.src("crack.sh")
+        pre = code.split('== 3. 判决代理 ==')[0]
+        self.assertIn("agent-prewarm.log", pre, "预热发要有自己的判决日志")
+        self.assertIn("ga100vfi_agent", pre, "预热发必须有代理判，不能盲打")
+        self.assertIn("wait=$WAIT", pre, "预热的 settle 必须与正式批一致")
+        self.assertNotIn("wait=300", pre, "预热不许为了快点回来把 settle 改短")
+        self.assertRegex(pre, r'case\s+"\$PWV"\s+in', "必须有判决词闸门")
+        self.assertRegex(pre, r"\sunder\)", "只有 under 放行")
+        # 判决行的取法：`grep -oE '[^\n]*'` 在 ERE 括号里是"排除反斜杠和 n 两个字符"，不是"排除换行"，
+        # 于是带 n 的字段（unreachable / 任何后加的词）会把匹配咬断，PWV 变空 → 整批被误拦。
+        # 用 sed 的贪婪 `.* -> ` 取最后一个箭头，行为与既有解析一致。
+        self.assertIn("sed -n 's/.* -> \\([a-z_]*\\).*/\\1/p'", pre,
+                      "取判决词要用 sed，不用 [^\\n] 那种看着像排除换行的写法")
+        # 闸门放行之后才轮到 config 检查；顺序倒了会在"卡已掉链"时先打印误导信息
+        self.assertLess(pre.index('case "$PWV"'), pre.index("预热后 config="), "先问判决，再看总线")
+        self.assertNotIn('"j"', pre.split("== 2.9")[1], "预热段不许按 PEX_RST")
+        self.assertNotIn("printf 'J'", pre.split("== 2.9")[1])
+        self.assertIn("PREWARM_WAIT=${PREWARM_WAIT:-$(SP prewarm_wait_s)}", code,
+                      "预热等待上限要从规程取值（这里再留一份字面量 = 第 6 个出处）")
+        self.assertGreaterEqual(shot_policy.get("prewarm_wait_s"), 60,
+                                "预热发要走完 settle + 读 + 复核；比 60 s 短就是在把唯一一次可能的命中"
+                                "判给超时")
+
     def test_run_crack_sh_is_a_shell_with_no_geometry_of_its_own(self):
         """几何只能有一个出处。外壳再留一份默认值，就会有『我传的 PW 被改成别的』这种一天。"""
         code = self.src("run_crack.sh")
@@ -1076,6 +1319,88 @@ class BenchFlowScriptShape(unittest.TestCase):
         self.assertIn("setpci -s $BDF 4.w", code, "必须看 Command 寄存器")
         self.assertIn("wake", code, "Command=0 的形状必须给出 wake 这条处置")
         self.assertNotIn("4.w=", code, "体检脚本只读：Command 的写归 ga100vfi.burn wake")
+
+
+class PageClaims(unittest.TestCase):
+    """页面上的每句话都是操作程序的一部分：通道写错，人就照着错的那句去查。
+
+    触发这一条的是 2026-11-26 的一句"未运行：判决机上跑 host/ga100vfi_agent.py，**经串口连本板**"。
+    两处错：判决方与板子之间只有 WiFi/HTTP（`@A` 快照 + `/api/req`），串口是**人**的逃生舱
+    （`bench/console.sh`）；而"未运行"把"没收到心跳"当成了事实 —— 板子其实分得清"本次开机以来从
+    没见过"（`seq=0`）与"见过之后断了"（`seq>0`），这两种要查的东西完全不同（前者是没起 agent，
+    后者通常是 agent 退出或**板子先重启**，本台架为这类混淆查过串口）。
+    """
+
+    def setUp(self):
+        self.page = (Path(__file__).resolve().parents[2] / "main" / "webui.html").read_text(
+            encoding="utf-8")
+
+    def test_judge_channel_is_http_not_serial(self):
+        seg = self.page.split("let peerLine;")[1].split("$('peer')")[0]
+        self.assertIn("@A", seg, "判决方的可观测依据只有 @A 心跳，必须写在页面上")
+        self.assertIn("不需要串口", seg, "要显式否认串口，否则人会去查线")
+        # 整页（去掉注释行 —— 注释里允许引用被撤回的旧句子）里不许再出现"经串口"这种通道断言。
+        # 控制台那一格的 aria-label 是"串口命令"，那是给人用的命令集名字，不算通道断言。
+        visible = "\n".join(l for l in self.page.splitlines() if not l.strip().startswith("//"))
+        self.assertNotIn("经串口", visible)
+        self.assertNotIn("判决机上跑 host/ga100vfi_agent.py", visible)
+
+    def test_absent_judge_distinguishes_never_seen_from_dropped(self):
+        seg = self.page.split("let peerLine;")[1].split("$('peer')")[0]
+        self.assertIn("!peer.seq", seg, "seq=0（从没见过）与 seq>0（见过又断了）必须分开说")
+        # 没有心跳时固件把 age_s 填成 -1：拿它渲染就得到"-1s 前收到快照"这种假数
+        self.assertNotIn("${peer.age_s}s 前收到快照", seg.split("} else {")[-1])
+
+    def test_the_expiry_window_belongs_to_the_firmware_not_the_page(self):
+        """页面不许自己抄一份过期秒数。
+
+        0.5.6 的第一版这里写的是 `peer.present && peer.age_s <= 5`，而固件的 `present` 是
+        "本次开机以来收到过"的闩锁：代理被杀之后板子照样回 `present:true / age_s:6`，于是这一格
+        显示"在线" —— 比原来的"未运行"更毒，因为它说的是反话。过期门只能有一个主人（peer.h 的
+        PEER_STALE_US），页面读 `present`；两边各存一份"5"就会各改各的，还看起来一致。
+        """
+        seg = self.page.split("let peerLine;")[1].split("$('stop')")[0]
+        self.assertNotIn("age_s <= ", seg, "过期判定必须在固件里，页面只读 present")
+        self.assertIn("const judging = peer.present;", seg, "开火按钮的依据必须就是那个过期门")
+        peer_h = (Path(__file__).resolve().parents[2] / "main" / "peer.h").read_text(
+            encoding="utf-8")
+        match = re.search(r"#define\s+PEER_STALE_US\s+INT64_C\((\d+)\)", peer_h)
+        self.assertIsNotNone(match, "固件里必须真有这个过期门（不然页面的 present 从哪来）")
+        stale_s = int(match.group(1)) / 1_000_000
+        # 两侧的比例也必须钉住：心跳比窗口慢就等于长期"未运行"，快几十倍就是在毛刺窗口里刷请求
+        self.assertLessEqual(VerdictAgent.PEER_EVERY_S * 4, stale_s,
+                             f"心跳 {VerdictAgent.PEER_EVERY_S}s 对 {stale_s}s 的窗口余量不足")
+        self.assertGreaterEqual(VerdictAgent.PEER_EVERY_S, 0.2,
+                                "心跳也不许快到在波形附近反复插队")
+        self.assertEqual(VerdictAgent.PEER_STALE_S, stale_s,
+                         "代理里的'半个过期周期'用的必须是同一个数")
+
+    def test_a_stale_snapshot_still_shows_why_the_judge_stopped(self):
+        """陈旧时必须仍然渲染 info：代理死了，halt 是它留下的唯一现场说明。
+
+        这是固件那侧的契约（peer.c 用 `seen` 而不是 `present` 决定 info 给不给），页面这边要保证
+        不把"陈旧"实现成"清空"。两条各查一半，缺一半就退化成"未运行 + 什么都没有"。
+        """
+        peer_c = (Path(__file__).resolve().parents[2] / "main" / "peer.c").read_text(
+            encoding="utf-8")
+        render = peer_c.split("void peer_render", 1)[1]
+        self.assertIn("seen ? info : \"null\"", render,
+                      "info 必须按'收到过快照'给，不能按'心跳没过期'给")
+        seg = self.page.split("let peerLine;")[1].split("$('peer')")[0]
+        self.assertIn("if (peer.info)", seg, "陈旧分支之后仍要贴最后一份快照")
+
+    def test_page_reports_the_code_beside_the_millivolt(self):
+        """VOUT_COMMAND 的 LSB 是 6.25 mV：只显 mV 的页面会把三发重复看成一次搜索。"""
+        seg = self.page.split("let campaignLine")[1].split("$('campaign-status')")[0]
+        self.assertIn("v_code", seg)
+        self.assertIn("codes_tried", seg)
+
+    def test_post_shot_status_registers_show_nack_as_nack(self):
+        """可选寄存器"没读到"不等于"读到 0"：NACK 必须显式写出来。"""
+        seg = self.page.split("if (b.last)")[1].split("$('status')")[0]
+        self.assertIn("status_word", seg)
+        self.assertIn("status_vout", seg)
+        self.assertIn("(nack)", seg, "NACK 要显式标记，否则没实现的东西会被读成『没有故障』")
 
 
 class PresenceWatch(unittest.TestCase):
@@ -1103,6 +1428,46 @@ class PresenceWatch(unittest.TestCase):
             self.assertFalse(a.presence_sample(True, now=2.5))      # 回来了 → 计时清零
             self.assertFalse(a.presence_sample(True, now=3.0))
         a.stop_board.assert_not_called()
+
+    def test_一发在飞时看门狗用宽的宽限期(self):
+        """看门狗防的是"往死卡上打下一发"，不是"抛弃已经打出去的那一发"。
+
+        2026-11-26 08:23/08:27 两批实测：第 3 发（ladder 往深走到 vd=363）刚打出去，代理就以
+        「卡连续 3.0s/3.3s 不在 PCIe 上」停战，而 presence 记录器同一时刻看到卡 +2~+12 s 仍在场
+        （正常重枚举）⇒ 区间下沿唯一可能给 over 的那一发永远成 nojudge。
+        """
+        a = self._agent([0xFFFFFFFF] * 8)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(a.presence_sample(True, now=0.0, in_flight=True))
+            self.assertFalse(a.presence_sample(True, now=3.5, in_flight=True),
+                             "一发在飞时不许用 3 s 的空闲档把它抛弃")
+            self.assertFalse(a.presence_sample(True, now=9.0, in_flight=True))
+            self.assertTrue(a.presence_sample(True, now=12.0, in_flight=True),
+                            "宽限也不能无限：卡真死了要停，别把整批吊死")
+        # 空闲档（没有发在飞）必须还是 3 s：05:44 那批的形状是"卡没了板子还在连打"
+        b = self._agent([0xFFFFFFFF] * 8)
+        b.last_phase = "idle"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(b.presence_sample(True, now=0.0))
+            self.assertTrue(b.presence_sample(True, now=3.5),
+                            "空闲档被放宽 = 把 05:44 那个形状又放回来")
+
+    def test_在飞与否看板子的phase而不是代理手里的判决(self):
+        """pending 是"判决算好了待盖章"，那一发在飞时它是空的 —— 所以只能用板子的 phase。"""
+        a = self._agent([0xFFFFFFFF] * 8)
+        for phase in ("executing", "settle", "waiting"):
+            b = self._agent([0xFFFFFFFF] * 8)
+            b.last_phase = phase
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(b.presence_sample(True, now=0.0))
+                self.assertFalse(b.presence_sample(True, now=3.5),
+                                 f"phase={phase} 时这一发还没人判，不许用 3 s 抛弃它")
+        from ga100vfi_agent import IN_FLIGHT_PHASES
+        self.assertEqual(set(IN_FLIGHT_PHASES), {"executing", "settle", "waiting"})
+        # phase 名要真是板子会报的那些（改了板子字符串而代理没跟，看门狗就退回空闲档）
+        src = (Path(__file__).resolve().parents[2] / "main" / "campaign.c").read_text(encoding="utf-8")
+        for phase in IN_FLIGHT_PHASES:
+            self.assertIn(f'phase_locked("{phase}")', src, f"板子不再报 phase={phase}")
 
     def test_sustained_absence_stops_and_asks_the_board_to_stand_down(self):
         a = self._agent([0xFFFFFFFF] * 8)
@@ -1155,6 +1520,550 @@ class PresenceWatch(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(agent_module.run_forever(a, poll=0.2, max_lost=1), 2)
         self.assertEqual(a.presence_sample.call_count, 2)
+
+
+class JudgeHeartbeat(unittest.TestCase):
+    """判决方必须让板子的页面知道它活着（0.5.6）。
+
+    触发这件事的是 2026-11-26：crack.sh 的代理明明在判每一发，WIFI 页面却显示"判决方未运行"，
+    而那句話还写着"经串口连本板"。板子那侧的 `@A` 通道 0.5.0 就实现好了（`main/peer.c` +
+    `main.c:peer_cmd`），缺的只是主机侧从来没发过。这里钉的是**协议形状**（板子校验很严，整包会
+    被拒）与 **best-effort 语义**（心跳失败绝不能变成不判决）。
+    """
+
+    PEER_MAX = 256          # peer.c: PEER_INFO_MAX，且 ascii_json_object 逐字节查可打印 ASCII
+
+    def _agent(self, **kw):
+        agent = VerdictAgent('http://example.invalid', '0000:01:00.0', first_read_delay=0, **kw)
+        agent.status = Mock(return_value=waiting())
+        agent.gpu_verdict = Mock(return_value='under')
+        agent.feed = Mock()
+        agent.posts = []
+        agent.post_cmd = Mock(side_effect=lambda line: agent.posts.append(line) or "peer ok")
+        return agent
+
+    def _assert_board_would_accept(self, payload: str):
+        """把 peer.c 的 ascii_json_object 在测试里跑一遍，而不是相信它会接受。"""
+        self.assertTrue(payload.startswith("{") and payload.endswith("}"), payload)
+        self.assertLess(len(payload.encode()), self.PEER_MAX)
+        for ch in payload:
+            self.assertTrue(0x20 <= ord(ch) <= 0x7E, f"板子会整包拒收：{ch!r} in {payload!r}")
+        self.assertEqual(payload.count("{"), payload.count("}"))
+        json.loads(payload)                         # 板子原样嵌进 /api/status，必须合法
+
+    def test_heartbeat_is_one_at_A_frame_over_http(self):
+        agent = self._agent()
+        self.assertTrue(agent.push_snapshot(force=True))
+        self.assertEqual(len(agent.posts), 1)
+        frame = agent.posts[0]
+        self.assertTrue(frame.startswith("@A seq=0 "), frame)     # 板子按 '@A' 分派（main.c:564）
+        self._assert_board_would_accept(frame.split(" ", 2)[2])
+        self.assertTrue(agent.peer_ok)
+
+    def test_snapshot_carries_what_the_page_cannot_get_from_the_board(self):
+        # 板子知道自己的 tries/phase，但它不知道**代理为什么停手**：halt/ledger 只有判决方有。
+        agent = self._agent()
+        agent.shots, agent.tally, agent.dirty = 4, {"under": 3, "lost": 1}, 2
+        agent.last_verdict, agent.stable, agent.halt = "lost", False, "presence"
+        snap = agent.snapshot()
+        self.assertEqual(snap["halt"], "presence")
+        self.assertEqual(snap["state"], "stopped:presence")
+        self.assertIn("shots=4", snap["ledger"])
+        self.assertIn("dirty=2", snap["ledger"])
+        self.assertIn("stable=NO", snap["last"])
+
+    def test_a_long_or_non_ascii_reason_cannot_silence_the_heartbeat(self):
+        # 中文停手原因会让整包被板子拒收 —— 页面于是又变成"未运行"，而且是**被静默地**变成。
+        # 所以要求：在主机侧消毒，而不是等着被拒。
+        agent = self._agent()
+        agent.halt = "presence 看门狗停战（config 全 1）"
+        agent.last_fail = "restore-failed: 上游桥没起链路 " * 12
+        payload = agent.peer_frame().split(" ", 2)[2]
+        self._assert_board_would_accept(payload)
+        snap = json.loads(payload)
+        self.assertNotIn("看门狗", snap["halt"])
+        self.assertTrue(snap["state"].startswith("stopped:"))
+
+    def test_overlong_snapshot_drops_fields_in_priority_order(self):
+        # 溢出只能由**不截断**的字段造成（last_fail 进 snapshot 时已被削到 20 字符）—— 真会出现的
+        # 形态就是 halt 被写成一句长话。丢字段的顺序必须是"装饰先丢，state/halt 最后动"。
+        agent = self._agent()
+        agent.halt = "poison " + "y" * 400
+        snap = agent.snapshot()
+        self.assertIn("halt", snap, "state/halt 是'代理还活着吗/为什么停'，最后才许动")
+        self.assertIn("state", snap)
+        self.assertNotIn("note", snap)
+        self.assertNotIn("gates", snap)
+        self._assert_board_would_accept(json.dumps(snap, separators=(",", ":")))
+        # 类属性不能被改写：否则第一次溢出之后，之后每一份快照都永久少掉同一批字段
+        self.assertEqual(agent.PEER_DROP_ORDER, ("note", "gates", "next", "ledger", "last"))
+
+    def test_heartbeat_failure_never_costs_a_verdict(self):
+        agent = self._agent()
+        agent.post_cmd = Mock(side_effect=OSError("wifi down"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(agent.push_snapshot(force=True))
+        self.assertFalse(agent.peer_ok)
+        self.assertIn("wifi down", agent.peer_err)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(agent.step())                 # 判决照交
+        agent.feed.assert_called_once()
+
+    def test_heartbeat_stays_quiet_during_the_waveform_but_cannot_lie_forever(self):
+        agent = self._agent()
+        agent.last_phase = "executing"
+        self.assertTrue(agent.push_snapshot(force=True))
+        self.assertFalse(agent.push_snapshot())                    # 1 s 之内不重发
+        agent._peer_t -= 3.0                                       # 距上次 3 s：波形中但快过期
+        self.assertTrue(agent.push_snapshot(), "宁可多发一个请求，也不能让页面假显示'未运行'")
+
+    def test_disabled_by_flag(self):
+        agent = self._agent()
+        agent.peer_every_s = 0.0
+        self.assertFalse(agent.push_snapshot(force=True))
+        self.assertEqual(agent.posts, [])
+
+    def test_the_agent_does_not_fire_on_the_page_start_request(self):
+        """回包里带页面的 op=start 时只许打印。代管开火=绕过 crack.sh 的发前闸门。"""
+        agent = self._agent()
+        agent.post_cmd = Mock(side_effect=lambda line: agent.posts.append(line)
+                              or "req pending op=start&vd=350&max=200")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertTrue(agent.push_snapshot(force=True))
+        self.assertEqual(len(agent.posts), 1, "不许把页面的请求转成一次真开火")
+        self.assertIn("不代管开火", out.getvalue())
+
+    def test_stop_paths_publish_the_halt_reason(self):
+        # 停手那一刻页面必须知道是**谁**停的：presence/poison/lost/reacted 各自要查的东西不同。
+        for flag, expect in (("lost_stopped", "lost"), ("reacted", "reacted")):
+            agent = self._agent()
+            setattr(agent, flag, True)
+            agent.step = Mock(return_value=False)
+            agent.stop_board = Mock()
+            agent.presence_sample = Mock(return_value=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = agent_module.run_forever(agent, poll=0.06, max_lost=1)
+            self.assertIn(code, (2, 4))
+            self.assertTrue(agent.posts, "停手时没发心跳：页面只会显示过期的在线")
+            self.assertIn(f'"halt":"{expect}"', agent.posts[-1])
+        agent = self._agent()
+        agent.step = Mock(return_value=False)
+        agent.presence_sample = Mock(return_value=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agent_module.run_forever(agent, poll=0.06, max_lost=1), 2)
+        self.assertIn('"halt":"presence"', agent.posts[-1])
+
+    def test_poll_zero_cannot_silence_the_presence_watchdog(self):
+        """poll=0 曾让内圈一次都不跑：卡离开总线的保护静默消失，循环还会永久空转。"""
+        agent = self._agent()
+        agent.step = Mock(return_value=False)
+        agent.presence_sample = Mock(return_value=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = agent_module.run_forever(agent, poll=0.0, max_lost=1)   # 抬到下限，必须停
+        self.assertEqual(code, 2)
+        self.assertTrue(agent.presence_sample.called, "看门狗一次都没跑 = 保护被 poll=0 关掉了")
+
+    def test_seq_continues_from_what_the_board_already_has(self):
+        """换一个 agent 进程不许把"最后快照 #N"数回去。
+
+        板子的 peer_store 不校验单调（原样存），所以倒退不会被挡 —— 只会让操作员看见 #5 变 #3，
+        而那个征状在他眼里意味着"板子重启过"，恰好是这两态里另一态的征状。0.5.7 上板自证第 5 节
+        实测到的就是这个倒退。
+        """
+        agent = self._agent()
+        agent.status = Mock(return_value={"campaign": {}, "peer": {"seq": 5, "present": True}})
+        self.assertEqual(agent.seed_peer_seq(), 6, "板子上那份是 #5，下一份必须是 #6")
+        self.assertTrue(agent.push_snapshot(force=True))
+        self.assertTrue(agent.posts[0].startswith("@A seq=6 "), agent.posts[0])
+        self.assertTrue(agent.push_snapshot(force=True))     # 本实例自己往上数
+        self.assertTrue(agent.posts[1].startswith("@A seq=7 "), agent.posts[1])
+
+    def test_seq_seeding_never_blocks_the_heartbeat(self):
+        # 种子读不到（板子刚起、WiFi 抖、测试台）就从 0 数 —— 心跳本身比序号对不对更值钱。
+        agent = self._agent()
+        agent.status = Mock(side_effect=OSError("board not answering"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agent.seed_peer_seq(), 0)
+            self.assertTrue(agent.push_snapshot(force=True))
+        self.assertTrue(agent.posts[0].startswith("@A seq=0 "), agent.posts[0])
+
+    def test_post_cmd_reaches_the_console_endpoint(self):
+        # /api/cmd 是**人**用的那个入口：心跳走同一条路，才不会出现"只有脚本看得见代理"。
+        agent = self._agent()
+        agent.post_cmd = VerdictAgent.post_cmd.__get__(agent, VerdictAgent)   # 用回真方法
+        seen = {}
+
+        class Resp:
+            def read(self): return b"peer ok"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake(request, timeout=None):
+            seen["url"] = request.full_url
+            seen["data"] = request.data
+            seen["timeout"] = timeout
+            return Resp()
+
+        with patch.object(agent_module.urllib.request, "urlopen", fake):
+            self.assertEqual(agent.post_cmd("@A seq=1 {}"), "peer ok")
+        self.assertTrue(seen["url"].endswith("/api/cmd"), seen)
+        self.assertTrue(seen["data"].startswith(b"@A "))
+        self.assertEqual(seen["timeout"], agent.timeout, "心跳也必须带超时：卡死的 HTTP 不能挂住代理")
+
+
+class ShotPolicy(unittest.TestCase):
+    """每发前后的操作规程必须有唯一出处，而且必须能在代码里找到落点。
+
+    为什么单独一组测试：发数打到几百发之后，「打完之后我们到底做了什么」这件事仍然要靠人回忆，
+    而回忆的代价今天付了两次 —— CARD_SETTLE_S 被判决机上那层不在版本库里的入口写死成 25（改了不
+    生效）、批前 487 行 FF capture 被我随手塞进开火脚本（每个电源周期从此都在第 2 发死）。把规程
+    写进 host/ga100vfi/shot_policy.py 之后，这组测试负责让「散着的默认值」重新变成编译期事故。
+    """
+
+    ROOT = Path(__file__).resolve().parents[2]
+
+    def test_代理的默认值全部来自规程(self):
+        ag = VerdictAgent('http://example.invalid', '0000:01:00.0')
+        for attr, key in (('max_lost', 'max_lost'),
+                          ('first_read_delay', 'first_read_delay_s'),
+                          ('confirm_reads', 'confirm_reads'),
+                          ('stable_s', 'stable_s'),
+                          ('budget_s', 'verdict_budget_s'),
+                          ('max_bar0_sessions', 'bar0_sessions_per_shot'),
+                          ('presence_grace_s', 'presence_grace_s')):
+            self.assertEqual(getattr(ag, attr), shot_policy.get(key),
+                             f"VerdictAgent.{attr} 没从 shot_policy.{key} 取：又出现第二个出处了")
+
+    def test_仓库里不许在规程之外写死每发的节奏(self):
+        bad = shot_policy.check_scripts(str(self.ROOT))
+        self.assertEqual([], bad, "这些脚本把节奏常量写死在规程之外：\n" + "\n".join(bad))
+
+    def test_crack_sh确实是从规程取值而不是干脆删掉(self):
+        # check_scripts 只保证"别处没写字面量"；这里保证 crack.sh 真的去取了（否则它会安静地
+        # 依赖代理的默认值，而默认值改了没人知道）。
+        txt = (self.ROOT / 'bench' / 'crack.sh').read_text(encoding='utf-8')
+        for key in ('card_settle_s', 'first_read_delay_s', 'confirm_reads', 'stable_s',
+                    'prewarm_wait_s', 'bar0_sessions_per_shot', 'wait_card_s', 'prewarm',
+                    'capture_min_gap_s', 'settle_wait_ms', 'survivor_halt_s',
+                    'halt_read_tries', 'halt_read_gap_s'):
+            self.assertIn(f'(SP {key})', txt, f"crack.sh 没有从规程取 {key}")
+        # 调用点在，定义也得在：部署器就是靠这条拒绝上线的（改名会让 crack.sh 安静地拿不到值）
+        self.assertRegex(txt, r"(?m)^SP\(\)\s*\{", "crack.sh 里那个取值函数的定义没了")
+
+    def test_规程的数必须彼此咬得住(self):
+        g = shot_policy.get
+        # 判决预算必须容得下"静默下限 + 盖章复读"，否则把 first_read_delay 调大就会把每一发判成
+        # lost —— 这类"两个默认值互相咬"的坑必须比现场更早爆炸。
+        need = (g('first_read_delay_s') + g('stable_s') * max(0, g('confirm_reads') - 1) + 10)
+        self.assertGreater(g('verdict_budget_s'), need)
+        if g('bar0_sessions_per_shot'):
+            self.assertGreaterEqual(g('bar0_sessions_per_shot'), g('confirm_reads'))
+        # 全量 capture 与第一发之间必须留够距离（红线 1 的机制，见 capture_min_gap_s 的 why）
+        self.assertGreaterEqual(g('capture_min_gap_s'), 60)
+
+    def test_合法模式不许被参数校验拒掉(self):
+        """2026-11-26：`--max-bar0-sessions >= 1` 这条校验把 config-only 模式挡在门外，那一批
+        预热代理起不来、正式批没发一发，症状只是"批已结束 +30s"。校验本身也要有测试。"""
+        a = agent_module.validated_args(["http://example.invalid", "--max-bar0-sessions", "0"])
+        self.assertEqual(0, a.max_bar0_sessions, "0（一发都不读）必须是合法值")
+        self.assertEqual(0, a.confirm_reads, "一次都不读时【盖章】这个概念必须一起关掉，而不是判成盖章失败")
+        d = agent_module.validated_args(["http://example.invalid"])
+        self.assertEqual(shot_policy.get("bar0_sessions_per_shot"), d.max_bar0_sessions,
+                         "argparse 又自带了一份默认值")
+        self.assertEqual(shot_policy.get("confirm_reads") if d.max_bar0_sessions else 0,
+                         d.confirm_reads)
+        with self.assertRaises(SystemExit):
+            # 会话预算不够盖章：这才是该拒的形状
+            agent_module.validated_args(["http://example.invalid", "--max-bar0-sessions", "1",
+                                         "--confirm-reads", "2"])
+
+    def test_每条规程都有代码落点(self):
+        for name, steps in (('BEFORE_SHOT', shot_policy.BEFORE_SHOT),
+                            ('AT_SHOT', shot_policy.AT_SHOT),
+                            ('AFTER_SHOT', shot_policy.AFTER_SHOT)):
+            self.assertTrue(steps, f"{name} 空了：规程不能只是愿望")
+            for kind, text, where in steps:
+                self.assertIn(kind, ('must', 'never'), f"{name}: {text}")
+                self.assertTrue(text.strip() and where.strip(), f"{name}: 缺文字或缺落点 {text}")
+
+    def test_config_only判决一次BAR0都不开(self):
+        """bar0 会话预算=0 ⇒ 连 Bar0() 都不许构造（restore 写 COMMAND 也不算"只是读"）。"""
+        ag = VerdictAgent('http://example.invalid', '0000:01:00.0',
+                          first_read_delay=0, budget_s=5, max_bar0_sessions=0)
+        ag.status = Mock(return_value=waiting())
+        ag.present = Mock(return_value=True)
+
+        def boom(*a, **k):
+            raise AssertionError("config-only 判决却构造了 Bar0：这就是杀死卡的那只手")
+
+        tok = awaiting_token(waiting())
+        with patch.object(agent_module, 'Bar0', boom):
+            self.assertEqual('under', ag.evaluate(tok))
+        self.assertEqual(0, ag.reads, "config-only 判决的读数计数必须为 0（台账要能看出没盖章）")
+        self.assertIsNone(ag.stable, "没读寄存器就不是 stable=yes：它天生未盖章")
+        self.assertTrue(ag.present.called)
+
+    def test_config_only判决卡不在场时判lost而不是继续读(self):
+        ag = VerdictAgent('http://example.invalid', '0000:01:00.0', first_read_delay=0,
+                          budget_s=0.3, poll_s=0.05, max_bar0_sessions=0)
+        ag.status = Mock(return_value=waiting())
+        ag.present = Mock(return_value=False)
+        with patch.object(agent_module, 'Bar0',
+                          lambda *a, **k: self.fail("卡都不在场还开 BAR0")):
+            self.assertEqual('lost', ag.evaluate(awaiting_token(waiting())))
+        self.assertEqual(0, ag.reads)
+
+    def test_冻结配方就是档案里那一发(self):
+        """11-21 唯一命中的那发：vd=372 td=-40 vr=750 tr=-20 2x222 gap=150 delay=64 revert=0。
+
+        钉死它是因为判决机外壳以前自带过 REV=1 / SWIN=1200 的默认值：那一忘 export 就不是那一发了，
+        而"我们打了 60 发其实打的不是同一发"这种事故从日志里看不出来。
+        """
+        self.assertEqual(shot_policy.RECIPE, dict(
+            PULSES=2, PW=222, GAP=150, TD=-40, VR=750, TR=-20, VD=372, MINV=372, MAXV=372,
+            STEP=2, DELAYS=64, MAX=60, SWIN=0, REVERT=0, BATCH=1, PREWARM=1),
+            "冻结配方漂了：改它要在决策链里给理由，而不是改这里让测试变绿")
+        self.assertIn("export PW=222", shot_policy.recipe_exports())
+
+    def test_判决机外壳是纯透传(self):
+        bad = shot_policy.check_entry()
+        self.assertEqual([], bad, "判决机外壳又自带配方/节奏了：\n" + "\n".join(bad))
+        run = (self.ROOT / "bench" / "judge-entry" / "run.sh").read_text(encoding="utf-8")
+        batch = (self.ROOT / "bench" / "judge-entry" / "batch.sh").read_text(encoding="utf-8")
+        for text, name in ((run, "run.sh"), (batch, "batch.sh")):
+            self.assertNotIn("mig-card2/run.sh", text, f"{name} 还在引用仓库外那份入口层")
+            self.assertIn("shot_policy", text, f"{name} 的节律没从规程取")
+        self.assertIn("presence7.csv", run, "presence 记录器是'卡活到第几秒'的唯一证据，不能被删")
+
+    def test_开火脚本用生成的配方而不是抄一份(self):
+        code = (self.ROOT / "temp" / "r_fast.sh").read_text(encoding="utf-8")
+        # 只看真正会执行的行：注释里提这些名字是这件东西的历史，不是第二个出处。
+        body = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("#"))
+        self.assertIn("--recipe", body, "开火脚本又自己抄了一份配方：它会和 shot_policy 漂开")
+        self.assertNotIn("/root/mig-card2/run.sh", body, "还在用仓库外那层入口（跨机器 sed 那一天的根源）")
+        for literal in ("PW=222", "VD=372", "CARD_SETTLE_S=", "CONFIRM_READS=", "FIRST_READ_DELAY="):
+            self.assertNotIn(literal, body, f"开火脚本里又出现了字面量 {literal}")
+
+    def test_survivor闸门就地读窗口(self):
+        """卡一直活着时，那唯一一次熔丝读数必须在闸门里当场花掉，不能等批末。
+
+        2026-11-26 07:27:35 第一次出现这个形状（11 发、卡活到最后一发后 +90 s）：板子 07:30:03 停在
+        stopped，批末那次 burn status 落在 07:30:3x —— 中间隔着盯梢循环退出、台账、包络门禁、survival
+        表，实测 ~30 s，卡在这 30 s 里死了，读回来是 ff ff。零读模式下这是整批唯一一次能读到窗口的
+        机会，读晚了等于这批白打。所以：闸门里先 op=stop 再读（读的同时不能有新的坑），批末那一次
+        见到落盘读数就跳过。
+        """
+        code = (self.ROOT / "bench" / "crack.sh").read_text(encoding="utf-8")
+        gate = code.split("$(SP survivor_halt_s)")[1].split("CONS_LOST")[0]
+        self.assertIn("window-at-halt.txt", gate, "survivor 闸门没有就地读熔丝状态")
+        self.assertLess(gate.index("op=stop"), gate.index("window-at-halt.txt"),
+                        "必须先停战役再读：读的那 1~2 s 里板子不能正在打下一发")
+        self.assertIn("burn", gate, "闸门要读的是熔丝状态（burn status），不是别的东西")
+        entry = (self.ROOT / "bench" / "judge-entry" / "batch.sh").read_text(encoding="utf-8")
+        self.assertIn("window-at-halt.txt", entry,
+                      "批末那次读不认闸门落盘的读数 ⇒ 同一个周期白花两次 BAR0 会话")
+
+    def test_批内里程碑有时间钟(self):
+        """起批→预热→op=start 这几步必须有墙钟里程碑，否则"每周期只买到 2 发"永远只能靠猜。
+
+        2026-11-26：07:49:42 起批、07:50:35 战役第一发 executing，中间 50 s 归属不明（只能从文件 mtime
+        反推它在预热段）。$SECONDS + date 的 TS 打印是唯一不靠事后考古就能分到每一步的办法。
+        """
+        code = (self.ROOT / "bench" / "crack.sh").read_text(encoding="utf-8")
+        for milestone in ('TS "crack.sh 起来', 'TS "预热发开始', 'TS "预热战役已 park',
+                          'TS "预热段结束', 'TS "战役 op=start 之前'):
+            self.assertIn(milestone, code, f"批内里程碑缺 {milestone}")
+        self.assertIn("${SECONDS}s", code, "里程碑必须带批内累计秒数，光有墙钟看不出花了多久")
+
+    def test_锁检查的串口预算来自规程(self):
+        """锁检查那两次 console 往返实测吃掉 38 s，而卡只活 ~60 s —— 预算必须受控并且两处副本一致。
+
+        console.sh 的第一行输出就是它的预算公式：tries × (wait + 1) + 3。监听窗口【无论有没有答复都会
+        跑满】，所以 wait=6 时一次"成功"的调用也要 7 s，判前 + 解后两次就是十几到三十几秒。它以前在
+        crack.sh 与 console.sh（还有 crack.sh 内嵌的那份兜底副本）各写一份，谁都没被钉住。
+        """
+        crack = (self.ROOT / "bench" / "crack.sh").read_text(encoding="utf-8")
+        for knob in ("console_tries", "console_wait_s", "console_repeat"):
+            self.assertIn(f"(SP {knob})", crack, f"crack.sh 没从规程取 {knob}：串口预算又变成写死的")
+        for rel in ("bench/console.sh",):
+            txt = (self.ROOT / rel).read_text(encoding="utf-8")
+            for env_name, knob in (("CON_TRIES", "console_tries"), ("CON_WAIT", "console_wait_s"),
+                                   ("CON_REPEAT", "console_repeat")):
+                m = re.search(rf"{env_name}=\$\{{{env_name}:-([0-9]+)\}}", txt)
+                self.assertIsNotNone(m, f"{rel} 里 {env_name} 的兜底值找不到了")
+                self.assertEqual(shot_policy.get(knob), int(m.group(1)),
+                                 f"{rel} 的 {env_name} 兜底值与规程 {knob} 不一致（人工直调时会漂）")
+        # 内嵌兜底副本也必须在同一预算上（它没有 SP，只能靠测试钉）
+        self.assertIn("CON_TRIES=${CON_TRIES:-2}", crack,
+                      "crack.sh 内嵌的 console 兜底副本预算与规程不一致")
+
+    def test_孤儿代理要被收掉而不是把整批挡在门外(self):
+        """发前那条"已有代理"闸门必须分得清孤儿与在判，否则它会自己饿死自己。
+
+        2026-11-26 07:55:17：crack.sh 死在自己新加的一行上（set -u + 未初始化变量），预热代理被留在
+        场上；下一批 r_fast.sh 看到代理在跑就直接 exit 3，白扔掉一张还活着、还在总线上的卡。真正的
+        危险是【有 crack.sh 活着】= 那一批正在判决，两个 BAR0 参与者会互相踩；代理活着而发射器死了
+        只是事故残留，必须收掉。
+        """
+        code = (self.ROOT / "temp" / "r_fast.sh").read_text(encoding="utf-8")
+        self.assertIn("bash .*crack.sh", code, "闸门不再区分【在判的代理】与【孤儿代理】")
+        self.assertLess(code.index("bash .*crack.sh"), code.index("pkill -9 -f 'ga100vfi_ag[ent]'"),
+                        "必须先确认没有发射器在跑，再收代理；顺序反了会把正在判的那批的代理杀掉")
+
+    def test_找区间阶段每发必须真读一次(self):
+        """MODE 决定这批是【找区间】还是【死磕】；找区间不许用 config-only 判决。
+
+        操作员 2026-11-26：把这张卡当成新卡、忘记历史，按一般流程重新找区间。找区间的判据是 under 与
+        over 的分界，而 config-only 只看得见"卡在不在场"，永远给不出 over —— 那种批次跑完，区间边界
+        一根都没量到，只是又烧了一个电源周期。反过来（hammer）才该零读。
+        """
+        exports = {}
+        for ln in shot_policy.recipe_exports().splitlines():
+            verb, _, rest = ln.partition(" ")
+            self.assertEqual(verb, "export", f"配方导出行形状不对：{ln}")
+            name, sep, val = rest.partition("=")
+            self.assertTrue(sep, f"导出行没有 =：{ln}")
+            exports[name] = val
+        self.assertIn(shot_policy.MODE, ("hunt", "hammer"), "MODE 只认这两个阶段")
+        if shot_policy.MODE == "hunt":
+            self.assertLessEqual(int(exports["MINV"]), int(exports["VD"]), "vd 必须落在带内")
+            self.assertLessEqual(int(exports["VD"]), int(exports["MAXV"]), "vd 必须落在带内")
+            if exports["MINV"] == exports["MAXV"]:
+                # 钉死一个坐标 = 把整个周期的发数押在同一格上。板子对 `VD=MINV=MAXV` 豁免去重，
+                # 所以代码不会拦我们 —— 拦的只能是理由：没有台账里那一格有命中迹象，就不该钉死。
+                self.assertIn("goldilocks", shot_policy.SWEEP_WHY,
+                              "把带钉成一个坐标必须有【命中迹象】级别的理由，并写进 SWEEP_WHY")
+            self.assertGreaterEqual(
+                int(exports["VD"]), shot_policy.MEASURED_LETHAL_MV + int(exports["STEP"]),
+                "战役起点至少要比【实测致死格】高一格：落在致死格或更深 ⇒ 首发判不出来，"
+                "（2026-11-26 实测：vd=334 首发即死、vd=356 从来没判到）")
+            # 预热发的坐标单独钉：它吸收的是【冷态第一发】这个危险状态，不是替阶梯试深。
+            self.assertIn("PREWARM_VD", exports,
+                          "预热坐标必须由规程导出；它一旦退回成 $VD 的别名，抬起点就等于让预热去试深")
+            self.assertGreaterEqual(
+                int(exports["PREWARM_VD"]), shot_policy.MEASURED_LETHAL_MV + 2 * int(exports["STEP"]),
+                "预热发必须打在【从没丢过卡】的格子上（比致死格至少隔两格）：08:54:22 那批预热首发打死"
+                "卡 ⇒ 闸门拒开正式批 ⇒ 整个电源周期 0 判决")
+            crack = (self.ROOT / "bench" / "crack.sh").read_text(encoding="utf-8")
+            self.assertIn("op=start&vd=$PREWARM_VD", crack,
+                          "crack.sh 的预热战役又去打 $VD 了（预热与战役起点必须分开）")
+            self.assertGreaterEqual(int(exports["BAR0_SESSIONS"]), 1,
+                                    "找区间却不读熔丝块 ⇒ under/over 分不出来，边界量不到")
+            # 操作员 2026-11-26："为啥总是 3 发，不应该是打得越多越好" —— 答案：不是上限卡的，是卡
+            # ~11 s 就掉线 + max_lost=1 一发即停火（红线，不许放宽）。既然如此，那几发每一发都必须落在
+            # 没量过的格子上：BATCH=2 时有 2 发在重复 368，而它的 under 早已有 10+ 发盖章。
+            self.assertLessEqual(int(exports["BATCH"]), 1,
+                                 "找区间不许在已知 under 的坐标上重复消耗每周期那 ~3 发的预算")
+            # 深格子是【在判决之前就死】的：读排在死亡之后 = 整批 0 判决（08:05:33 与 08:18:34 两批）
+            self.assertIn("FIRST_READ_DELAY", exports,
+                          "hunt 阶段不覆盖读时刻 ⇒ 4 s 的读又落在死亡之后，白扔一个电源周期")
+            self.assertLessEqual(int(exports["FIRST_READ_DELAY"]),
+                                 shot_policy.get("first_read_delay_s"),
+                                 "找区间的读必须不晚于死磕阶段")
+            self.assertGreaterEqual(int(exports["FIRST_READ_DELAY"]), 1,
+                                    "再早就撞上红线（在 ROM/devinit 里读熔丝块会挂死判决机）")
+            # 真正的读时刻 = 板子的 settle + 代理的 FIRST_READ_DELAY。只调后者等于只转半个旋钮：
+            # 09:00:37 那批卡在第 2 发后 +6.7 s 持续不可达，而我们的读排在 4000+2000=6 s —— 差 1 s 判不到。
+            self.assertIn("WAIT", exports,
+                          "hunt 阶段不覆盖 settle ⇒ 读永远排在发后 4+2=6 s，深格子每次都刚好落在死亡之后")
+            total_ms = int(exports["WAIT"]) + 1000 * int(exports["FIRST_READ_DELAY"])
+            self.assertLessEqual(total_ms, 5000,
+                                 "发后到第一次读的总静默必须明显早于实测死亡时刻（~6.7 s）")
+            self.assertGreaterEqual(total_ms, 3000,
+                                    "总静默 <3 s 就排进卡自己的 PERST# 重枚举/ROM 里 —— 红线 1")
+        else:
+            self.assertEqual(exports["VD"], exports["MINV"], "hammer 阶段就该钉死一个坐标")
+        code = (self.ROOT / "temp" / "r_fast.sh").read_text(encoding="utf-8")
+        self.assertIn("阶段=${MODE}", code, "批报告要回显阶段，否则台账答不出这批是找区间还是死磕")
+
+    def test_零读是hammer的设定不是全局默认(self):
+        """代理的默认必须是【盖章判决】；零读只能由 MODE=hammer 显式导出。
+
+        2026-11-26 把 bar0_sessions_per_shot 的全局默认改成 0（那天做零读对照批）之后，9 条代理测试
+        同时变红：'lost' 被判成 'under'、复读与寄存器留痕全丢、first_read_delay 的下限没人验了。
+        那不是测试太挑剔 —— 它说的是：任何不经批脚本的人工直调都会静默产出未盖章的 under，而
+        未盖章的 under 会让我们继续往一张已经动了的卡上打下一发。
+        """
+        self.assertGreaterEqual(shot_policy.get("bar0_sessions_per_shot"), 1,
+                                "默认零读 = 人工直调代理就得到未盖章判决")
+        self.assertGreaterEqual(shot_policy.get("confirm_reads"), 1,
+                                "默认不许盖章复读=0（同上：默认必须是能盖章的那一档）")
+        self.assertEqual(shot_policy.HAMMER.get("BAR0_SESSIONS"), 0,
+                         "hammer 的零读必须显式导出，不能靠全局默认")
+        # 阶段切换必须同时改判决侧（只改搜索轴 = 找区间却判不出 over）
+        hunt = shot_policy.recipe_exports()
+        self.assertIn("export BAR0_SESSIONS=1", hunt, "hunt 阶段必须真读：config-only 给不出 over")
+
+    def test_开火入口只许有一个(self):
+        """能起战役的入口在 temp/ 下必须只有一个。
+
+        今天数了一下：temp/ 里堆了 119 个 .sh。成因每次都一样 —— 出一次事故我就新写一个脚本，而不是
+        把教训折回那一个入口，于是"这一批到底带的是哪组数"重新变成考古现场（r_fire.sh 里那份
+        `CARD_SETTLE_S=25` 正是这样挖出来的）。操作员的说法更直接：**就弄一个开火的脚本**。
+        要新形态就在 shot_policy 里做成键，或在 r_fast.sh 里加分支；新开一份 = 这条测试红。
+        """
+        import os
+        d = self.ROOT / "temp"
+        firing = [n for n in sorted(os.listdir(d))
+                  if n.endswith(".sh") and "judge-entry/run.sh" in
+                  (d / n).read_text(encoding="utf-8", errors="replace")]
+        self.assertEqual(["r_fast.sh"], firing,
+                         f"开火入口不止一个：{firing} —— 把差异折回 r_fast.sh 或做成规程键")
+
+    def test_temp_下的临时脚本是有穷集合(self):
+        """一条功能 = 一个脚本；确定的逻辑进 bench/ 或 host/，temp/ 只留三件一次性工具。
+
+        今天 temp/ 攒到 119 个 .sh：每次事故我都新写一个探针，于是"当时的逻辑"散在 119 份副本里，
+        而其中被验证过的那部分本该长成 bench/ 里的一个函数。白名单之外再出现 .sh，就说明有人在
+        用新脚本代替固化 —— 那正是操作员点名要停掉的习惯。
+        """
+        import os
+        allowed = {"r_fast.sh", "r_down.sh", "append_chain.sh"}
+        extra = sorted(n for n in os.listdir(self.ROOT / "temp")
+                       if n.endswith(".sh") and n not in allowed)
+        self.assertEqual([], extra,
+                         "temp/ 里出现了新的 .sh：%s —— 它是哪种功能？确定的话就并进 bench/*.sh 或 "
+                         "host/ga100vfi/ 里（带测试），别留在 temp/" % ", ".join(extra))
+
+    def test_发前的capture闸门在代码里而不是在注释里(self):
+        crack = (self.ROOT / 'bench' / 'crack.sh').read_text(encoding='utf-8')
+        early = (self.ROOT / 'bench' / 'early.sh').read_text(encoding='utf-8')
+        self.assertIn('last-capture', early, "early.sh 不再记 capture 时刻：闸门就成了瞎子")
+        self.assertIn('last-capture', crack)
+        self.assertIn('capture_min_gap_s', crack, "crack.sh 的 capture 闸门没引用规程")
+        self.assertIn('CAPTURE_OK_OLD', crack, "闸门必须留一条显式、要写理由的绕行路径")
+
+
+class UnjudgedShotAccounting(unittest.TestCase):
+    """打了但没人判的那一发，必须在台账里占一行。
+
+    2026-11-26 的 config-only 批：板子 tries=3、判决 2、`顺序` 里只有 2 行 —— presence 看门狗停战
+    吞掉了悬着的那一发。停战是对的，**少记一行是假的**：那之后"实发数"这一列本身不可信。
+    """
+
+    def test_看门狗停战时悬着的那一发要记成nojudge(self):
+        ag = VerdictAgent('http://example.invalid', '0000:01:00.0',
+                          first_read_delay=0, max_bar0_sessions=0)
+        # 只看停战那一段：判决还悬着（step 什么都不做），第二次 presence 采样时卡已经不在了。
+        ag.step = Mock(return_value=False)
+        ag.presence_sample = Mock(side_effect=[False, True])
+        ag.status = Mock(return_value={'campaign': dict(waiting()['campaign'],
+                                                        delay=64, v_dip=372)})
+        ag.stop_board = Mock()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(2, agent_module.run_forever(ag, poll=0.1, max_lost=1))
+        txt = out.getvalue()
+        self.assertIn("-> nojudge", txt, "悬着的那一发没进台账：实发数这一列是假的")
+        self.assertIn("delay=64", txt)
+        self.assertIn("vd=372", txt, "补记的行必须带坐标，否则不知道往哪个坐标重打")
+
+    def test_没有悬案时不要凭空多记一行(self):
+        ag = VerdictAgent('http://example.invalid', '0000:01:00.0', max_bar0_sessions=0)
+        ag.status = Mock(return_value={'campaign': {'running': False}})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(ag.note_unjudged("测试：战役已停"))
+        self.assertNotIn("nojudge", out.getvalue())
 
 
 if __name__ == '__main__':

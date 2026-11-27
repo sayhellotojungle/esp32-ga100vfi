@@ -79,7 +79,7 @@ glitch done pwd=... e1=... writes_failed=... slip=... reset_slip=... diag_ok=...
 
 主机代理保留未确认结果并重试网络提交，避免为重试再次执行会访问寄存器的分类。停止、重新启动或轮次变化后，旧结果被丢弃。
 
-SMBPBI 判决路径（旧 `mode=0`）于 0.4.1 删除。它的帧格式始终属于未获目标卡确认的实现，而本台架对该端点的四次读全部无回执（[UNLOCK_AND_POISON.md](UNLOCK_AND_POISON.md) §2.4.1），因此这条通路既没被验证过、也不可用；留下的只有"每一发都被一条不存在的通路判成 LOST"这一种后果。判决词表（`goldilocks`/`hit`/`under`/`over`/`lost`）与 `main/oracle.h` 保留，它们是 `/api/verdict` 与 campaign 计数器的词汇，不再包含任何读硬件的代码。
+SMBPBI 判决路径（旧 `mode=0`）于 0.4.1 删除。它的帧格式始终属于未获目标卡确认的实现，而本台架对该端点的四次读全部无回执（[UNLOCK_AND_POISON.md](UNLOCK_AND_POISON.md) §一），因此这条通路既没被验证过、也不可用；留下的只有"每一发都被一条不存在的通路判成 LOST"这一种后果。判决词表（`goldilocks`/`hit`/`under`/`over`/`lost`）与 `main/oracle.h` 保留，它们是 `/api/verdict` 与 campaign 计数器的词汇，不再包含任何读硬件的代码。
 
 ## 判决方通道（0.5.0）
 

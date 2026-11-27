@@ -123,12 +123,13 @@ class Rung:
 # **配方每张卡都可能不一样**，所以这里不把某一次的命中值写成宇宙律；写进来的是"怎么知道一组
 # 参数没在 work"的判据。今天付的学费就是这个判据本身：
 #
-#   我借了另一份文档里**作者台**的 `delay=117 / pw=198`（`20261119-…md` §2），在**本卡本台**上
+#   我借了上游档案里**作者台**的 `delay=117 / pw=198`，在**本卡本台**上
 #   连打 60+ 发：`DSOV` 从未离开 1、`CRC` 从未被打脏，而坐标从 374 到 366 都会掉链、slip 47 与
 #   236 都会死，四次硬死全在这一族。
 #
-# 这就是文档里定义过的 **over**（`over = DSOV=0 且 CRC 坏 或 PCIe 链路丢`，`docs/ADAPTIVE.md`），
-# 而 over 的处置是"变浅、不许在该态连打"（`20261119-…md` §4）。我却把它当随机死亡，在同一族里
+# 这就是文档里定义过的 **over**（`over = DSOV=0 且 CRC 坏 或 PCIe 链路丢`，判据在
+# `host/ga100vfi/classify.py`，定义见 `docs/UNLOCK_AND_POISON.md` §一），
+# 而 over 的处置是"变浅、不许在该态连打"。我却把它当随机死亡，在同一族里
 # 一路加深 —— 换句话说：**零反应 + 掉链 = 标定/相位问题，再加发数只会买到更多 over。**
 #
 # 于是规则是**按族冻结**（族 = pw × 相位档），而且判据只用**事故**，不用"有没有反应"：
@@ -163,6 +164,30 @@ OVER_CLASS = ("over", "lost", "dead", "poison")   # 只用于总结里的链路�
 # 写在这里而不是散在判据里，是因为换一张卡这两个数就变了 —— 变的是常量，不是判据。
 HEALTHY_DSOV = 1
 HEALTHY_CRC = 0x55
+
+# ---- 坐标的唯一真实单位：PMBus 码（与 main/glitch_plan.c 的 mv_to_code 同一条取整） ----
+# VOUT_COMMAND 是 Linear11 ULINEAR，LSB = 6.25 mV，所以"命令多少 mV"只是"命令哪个码"的写法：
+# 366/368/370 全是码 59，372/374/376/378 全是码 60（2026-11-26 对着最早的 0x8b 轨压采样核出来）。
+# 后果有两条：(1) 11-21 那次命中的"372→370→368→366 阶梯"里三发打的是同一个坐标；(2) 300..380
+# 这段合法带只有 14 个坐标，不是 81 个。固件 0.5.5 起梯子按码走并回报 v_code；host 侧凡是要说
+# "这是哪一发"的地方都要用码 —— 台账按 mV 索引，两批各写 372/375 时只有 code 看得出是同一发。
+MV_PER_CODE = 6.25
+
+
+def mv_to_code(mv: int) -> int:
+    """The code the VRM actually receives for a commanded millivolt.
+
+    Same rounding as the firmware's `mv_to_code()` in main/glitch_plan.c — (mv*16+50)/100 — and
+    host/tests pins that agreement, because two definitions drifting apart would silently make
+    the ledger claim two coordinates for one physical shot.
+    """
+    return (int(mv) * 16 + 50) // 100
+
+
+def code_to_mv(code: int) -> int:
+    """Nearest millivolt that rounds back to `code` (the ladder stores positions as mV)."""
+    return (int(code) * 100 + 8) // 16
+
 DSOV_SEEN = re.compile(r"\bDSOV=0x([0-9a-fA-F]{1,8})")
 CRC_SEEN = re.compile(r"\bCRC=0x([0-9a-fA-F]{1,8})")
 
@@ -197,7 +222,7 @@ MIN_SHOTS_TO_ESCALATE = FREEZE_AFTER   # 同一个数两种用途：攒够才升
 def family_stats(shots: list, pw: int, delay: int) -> dict:
     """一个族（pw × 相位档 = 单发能量 × 相位）到今天为止的战绩。
 
-    **已知缺口（2026-11-24，第三张卡）**：族键里没有 `pulses`，而脉冲数是独立的一维致死量。
+    **已知缺口（2026-11-24 那一轮）**：族键里没有 `pulses`，而脉冲数是独立的一维致死量。
     那张卡在 `pw=222` 相位档 40 这一族里同时有 `3×222@vd=380 -> dead` 与 `1×222@vd=380 ->
     under`（同深度、同 td、同 gap，只差脉冲数；命中的那发在相位档 80，也是 `1×222`）。所以本
     函数汇总出的"这一族的事故率"混合了两种不同形状 —— 用它做决定前得回看运行目录里的逐发

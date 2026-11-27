@@ -46,6 +46,14 @@ int64_t pex_held_us(void);
 // and by the glitch timeline's SCL-hold steps.
 void pmbus_scl_hold(bool low);
 
+// Timeline guard. While a glitch timeline runs, transfers must not start a bus bring-up:
+// a step that finds the bus down fails, it does not spend hundreds of ms re-detecting
+// pull-ups and walking the baud ladder (see pmbus.c). pmbus_seq_reopen() is the explicit
+// exception, for the step that ends an intentional SCL hold.
+void pmbus_seq_begin(void);
+void pmbus_seq_end(void);
+bool pmbus_seq_reopen(void);
+
 // Serial-protocol layer (line has no leading '@').
 void pmbus_cmd(char *opline);
 

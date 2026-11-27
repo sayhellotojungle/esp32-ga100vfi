@@ -14,6 +14,15 @@
 #define CAMPAIGN_MAX_BATCH    10000
 #define MANUAL_TIMEOUT_US    INT64_C(120000000)
 #define RETRY_DELAY_US       INT64_C(400000)
+/* A lost verdict says the card left PCIe; it says nothing about dip depth. It used to be
+ * charged to `over`, which made the ladder climb *shallower* while every remaining shot was
+ * fired at an absent card. Counted on its own now, and it cannot be ground forever either:
+ * twice at one point, or three times in a row, ends the campaign (2026-11-20's post-mortem:
+ * "lost -> one more shot -> poison"). */
+#define CAMPAIGN_MAX_LOST_POINT   2
+#define CAMPAIGN_MAX_LOST_STREAK  3
+/* Width of point_t.tried in codes (64 * 6.25 mV = 400 mV of search band). */
+#define LADDER_WINDOW_CODES       64
 
 typedef enum {
     ST_IDLE, ST_READY, ST_EXECUTING, ST_SETTLE, ST_WAIT_VERDICT,
@@ -22,15 +31,23 @@ typedef enum {
 
 typedef struct {
     int vd, step, direction;
-    int under, over, hit, visit_tries;
+    int under, over, hit, lost, visit_tries;
     bool searching;
+    /* Ladder codes already fired at this point, bit (code - code_base). This exists because
+     * the VRM's LSB is 6.25 mV: a millivolt ladder can spend four shots on two coordinates
+     * (2026-11-26: 372/370/368/366 -> codes 60/59/59/59). Refusing to move onto a code we
+     * already judged is the difference between searching 14 coordinates and burning a batch.
+     * Only used when the band holds more than one code — see ladder_next_locked(). */
+    uint64_t tried;
 } point_t;
 
 typedef struct {
     bool running, goldilocks, awaiting_verdict, stop_requested, restore_ok;
     char phase[20];
-    int delay, v_dip, step;
+    int delay, v_dip, v_code, step;
+    int codes_tried;                        /* distinct ladder codes this point has fired */
     int tries, valid, lost, nack, timeouts, under, over, hit;
+    int lost_streak;                          /* consecutive lost verdicts, any point */
     int best_delay, best_vdip;
     uint32_t session, attempt, sequence;
 } stat_t;
@@ -59,10 +76,101 @@ static void point_status_locked(void)
 {
     s_st.delay = s_cfg.delays[s_point];
     s_st.v_dip = s_points[s_point].vd;
+    /* The code is the coordinate; v_dip is only what the operator typed. Reporting both is
+     * what keeps a 2 mV "ladder" from being read back as four different shots (glitch_plan.h). */
+    s_st.v_code = glitch_mv_to_code(s_points[s_point].vd);
     s_st.step = s_points[s_point].step;
 }
 
-static void args_for(const campaign_cfg_t *cfg, int vd, int delay,
+/* ---- The ladder walks PMBus codes, not millivolts ----
+ *
+ * `step` stays in the millivolts the operator typed (it is what the console and the status
+ * block echo), but every move is quantised through glitch_mv_to_code() with a floor of one
+ * code. Without that, step=2 mV asks for 372 -> 370 -> 368 -> 366 and the VRM sees
+ * code 60 -> 59 -> 59 -> 59: three shots spent, two coordinates covered. Codes already fired
+ * at this point are skipped, because re-landing on one is the identical physical shot, not a
+ * retry of a noisy measurement.
+ */
+static int ladder_bit(int code, int lo)
+{
+    const int idx = code - lo;
+    return (idx >= 0 && idx < LADDER_WINDOW_CODES) ? idx : -1;
+}
+
+/* Millivolts to *fire* for a ladder position. A code we have not moved off keeps the number
+ * the operator typed: code 60 is 372 mV and 375 mV at once, and re-deriving it as 375 would
+ * split one physical coordinate across two entries in the ledger (verdicts.tsv and the
+ * envelope's family key both index on the millivolts we asked for). */
+static int ladder_mv(const point_t *p, int code)
+{
+    return code == glitch_mv_to_code(p->vd) ? p->vd : glitch_code_to_mv(code);
+}
+
+/* Returns the millivolts to fire next; *exhausted says every code between min_v and max_v has
+ * already been fired at this point, which is a result, not a reason to keep shooting.
+ * *new_direction may flip: when the requested direction runs into a code already fired (or
+ * into the wall of the band), the honest move is the nearest untried code, which can be
+ * behind us. */
+static int ladder_next_locked(const point_t *p, int direction, bool *exhausted,
+                              int *new_direction)
+{
+    const int lo = glitch_mv_to_code(s_cfg.min_v), hi = glitch_mv_to_code(s_cfg.max_v);
+    *exhausted = false;
+    *new_direction = direction;
+
+    int codes = (s_cfg.step * GLITCH_MV_PER_CODE_NUM +
+                 GLITCH_MV_PER_CODE_DEN / 2) / GLITCH_MV_PER_CODE_DEN;
+    if (codes < 1) codes = 1;                       /* one code is the smallest real step */
+    const int cur = glitch_mv_to_code(p->vd);
+    if (hi < lo) return p->vd;
+    /* VD=MINV=MAXV is the hammer: one coordinate, fired again and again on purpose. "You
+     * already tried that" is not an answer to that request, so the whole walk is off. */
+    if (hi == lo) return p->vd;
+    /* The mask only covers LADDER_WINDOW_CODES coordinates. A band wider than that is a
+     * coarse grid the operator is rotating through on purpose; keep the old clamp behaviour
+     * instead of pretending we know what has been tried. */
+    if (hi - lo + 1 > LADDER_WINDOW_CODES) {
+        int code = cur + direction * codes;
+        if (code < lo) code = lo;
+        if (code > hi) code = hi;
+        return ladder_mv(p, code);
+    }
+
+    int cand = cur + direction * codes;
+    if (cand < lo) cand = lo;
+    if (cand > hi) cand = hi;
+    int bit = ladder_bit(cand, lo);
+    if (bit < 0 || !(p->tried & (UINT64_C(1) << bit))) return ladder_mv(p, cand);
+
+    /* Nearest untried code in the requested direction, then coming back the other way. */
+    for (int pass = 0; pass < 2; pass++) {
+        const int dir = pass ? -direction : direction;
+        for (int code = cur + dir * codes; code >= lo && code <= hi; code += dir) {
+            const int b = ladder_bit(code, lo);
+            if (b >= 0 && (p->tried & (UINT64_C(1) << b))) continue;
+            *new_direction = dir;
+            return ladder_mv(p, code);
+        }
+    }
+    *exhausted = true;
+    return p->vd;
+}
+
+static void ladder_mark_locked(point_t *p, int mv)
+{
+    const int lo = glitch_mv_to_code(s_cfg.min_v);
+    const int bit = ladder_bit(glitch_mv_to_code(mv), lo);
+    if (bit >= 0) p->tried |= UINT64_C(1) << bit;
+}
+
+static int ladder_tried_count(const point_t *p)
+{
+    int n = 0;
+    for (uint64_t m = p->tried; m; m >>= 1) n += (int)(m & 1u);
+    return n;
+}
+
+void campaign_args_for(const campaign_cfg_t *cfg, int vd, int delay,
                      glitch_args_t *args)
 {
     glitch_args_defaults(args);
@@ -70,7 +178,7 @@ static void args_for(const campaign_cfg_t *cfg, int vd, int delay,
     args->vr = cfg->vr; args->tr = cfg->tr;
     args->tv = 0; args->fast = 1; args->hold_ms = 0;
     args->pulses = cfg->pulses; args->pw = cfg->pw; args->gap = cfg->gap;
-    args->delay = delay; args->revert = 0; args->swin = 0;
+    args->delay = delay; args->revert = cfg->revert; args->swin = cfg->swin;
 }
 
 static bool config_error(char *error, size_t n, const char *message)
@@ -100,7 +208,7 @@ bool campaign_cfg_validate(const campaign_cfg_t *cfg, char *error, size_t n)
         const int voltages[] = { cfg->vd, cfg->min_v, cfg->max_v };
         for (unsigned j = 0; j < sizeof voltages / sizeof voltages[0]; j++) {
             glitch_args_t args;
-            args_for(cfg, voltages[j], cfg->delays[i], &args);
+            campaign_args_for(cfg, voltages[j], cfg->delays[i], &args);
             if (!glitch_args_validate(&args, error, n)) return false;
         }
     }
@@ -251,6 +359,9 @@ static void outcome_locked(oracle_t verdict)
     point_t *p = &s_points[s_point];
     if (verdict == ORACLE_LOST) s_st.lost++;
     else s_st.valid++;
+    /* Only a reading that came back says anything about depth. The streak is per run of
+     * verdicts, so one judged shot between two losses does not buy a third lost. */
+    if (verdict != ORACLE_LOST) s_st.lost_streak = 0;
     switch (verdict) {
     case ORACLE_GOLDILOCKS:
         s_st.hit++; s_st.goldilocks = true;
@@ -264,20 +375,39 @@ static void outcome_locked(oracle_t verdict)
         break;
     case ORACLE_UNDER: s_st.under++; p->under++; break;
     case ORACLE_OVER:  s_st.over++; p->over++; break;
-    case ORACLE_LOST:  p->over++; break;
+    case ORACLE_LOST:
+        /* 0.5.5: this used to be `p->over++`. A card that left PCIe is not evidence that the
+         * dip was too deep: the ladder climbed shallower on every lost, and the shots kept
+         * going out at a card nobody could read (2026-11-20: three lost rounds, each with
+         * tries=2 — one judged lost and one nobody ever judged, docs/UNLOCK_AND_POISON.md §四). It now moves
+         * nothing and stops the campaign instead. */
+        p->lost++; s_st.lost_streak++;
+        if (p->lost >= CAMPAIGN_MAX_LOST_POINT ||
+            s_st.lost_streak >= CAMPAIGN_MAX_LOST_STREAK) {
+            finish_locked("lost", false);
+            return;
+        }
+        break;
     }
     if (p->searching && p->under + p->over + p->hit >= s_cfg.batch) {
         if (p->hit) p->searching = false;
         else if (p->under && p->over) {
-            p->step = p->step / 2 < 6 ? 6 : p->step / 2;
+            p->step = p->step / 2 < 6 ? 6 : p->step / 2;   /* 6 mV = one code: nothing finer */
         } else {
             int direction = p->under ? -1 : 1;
             if (p->direction && p->direction != direction)
                 p->step = p->step / 2 < 6 ? 6 : p->step / 2;
             p->direction = direction;
-            p->vd += direction * p->step;
-            if (p->vd < s_cfg.min_v) p->vd = s_cfg.min_v;
-            if (p->vd > s_cfg.max_v) p->vd = s_cfg.max_v;
+            bool exhausted = false;
+            const int next = ladder_next_locked(p, direction, &exhausted, &p->direction);
+            if (exhausted) {
+                /* Every code in [min_v,max_v] was fired at this delay. With a 6.25 mV LSB
+                 * that band is 14 coordinates, not the 81 that the millivolt range suggests —
+                 * so this point is done, and re-firing a duplicate is not searching. */
+                finish_locked("exhausted", false);
+                return;
+            }
+            p->vd = next;
         }
         p->under = p->over = p->hit = 0;
     }
@@ -312,7 +442,11 @@ void campaign_poll(void)
                 s_st.attempt == UINT32_MAX) {
                 finish_locked("limit", false);
             } else {
-                args_for(&s_cfg, s_st.v_dip, s_st.delay, &args);
+                campaign_args_for(&s_cfg, s_st.v_dip, s_st.delay, &args);
+                /* Record the coordinate as fired, so the ladder never spends another shot on
+                 * a code it already judged. Marked here and not at the move, because a write
+                 * that NACKs is retried at the same coordinate and was never judged. */
+                ladder_mark_locked(&s_points[s_point], s_st.v_dip);
                 s_st.tries++; s_st.attempt++;
                 s_points[s_point].visit_tries++;
                 s_st.sequence = 0;
@@ -325,7 +459,7 @@ void campaign_poll(void)
         } else if (s_state == ST_SETTLE && now >= s_deadline) {
             // The settle interval is the card's own boot window; after it the
             // shot is only half-fired. Nothing on this board can tell whether the
-            // fuse block moved (docs/UNLOCK_AND_POISON.md §2.4.1: the SMBPBI
+            // fuse block moved (docs/UNLOCK_AND_POISON.md §一: the SMBPBI
             // endpoint never answered), so the campaign waits for the host.
             // MANUAL_TIMEOUT_US is the budget for that; nobody answering counts
             // the shot as timed out and infers no voltage direction.
@@ -398,19 +532,28 @@ void campaign_status_json(char *out, int n)
     if (s_mx) {
         xSemaphoreTake(s_mx, portMAX_DELAY);
         s = s_st;
+        /* Pointed at from the same lock so the count cannot mix two points' masks while the
+         * grid rotates. */
+        s.codes_tried = ladder_tried_count(&s_points[s_point]);
         xSemaphoreGive(s_mx);
     }
     // The status block is copied under the mutex so a verdict cannot interleave
     // half-updated counters into /api/status.
+    // v_code is the coordinate that physically exists (6.25 mV/LSB); v_dip is the millivolt
+    // the operator typed. codes_tried says how much of [min_v,max_v] this point has spent —
+    // the band is 14 codes wide, so "tries=40" and "codes_tried=14" together are the whole
+    // story of a batch that looked like a search and was a re-run.
     snprintf(out, (size_t)n,
-        "{\"running\":%s,\"phase\":\"%s\",\"delay\":%d,\"v_dip\":%d,"
-        "\"tries\":%d,\"valid\":%d,\"lost\":%d,\"nack\":%d,\"timeouts\":%d,"
+        "{\"running\":%s,\"phase\":\"%s\",\"delay\":%d,\"v_dip\":%d,\"v_code\":%d,"
+        "\"codes_tried\":%d,"
+        "\"tries\":%d,\"valid\":%d,\"lost\":%d,\"lost_streak\":%d,\"nack\":%d,\"timeouts\":%d,"
         "\"under\":%d,\"over\":%d,\"hit\":%d,\"goldilocks\":%s,"
         "\"best_delay\":%d,\"best_v_dip\":%d,"
         "\"session\":%" PRIu32 ",\"attempt\":%" PRIu32 ",\"sequence\":%" PRIu32 ","
         "\"awaiting_verdict\":%s,\"stop_requested\":%s,\"restore_ok\":%s}",
-        s.running ? "true" : "false", s.phase, s.delay, s.v_dip,
-        s.tries, s.valid, s.lost, s.nack, s.timeouts,
+        s.running ? "true" : "false", s.phase, s.delay, s.v_dip, s.v_code,
+        s.codes_tried,
+        s.tries, s.valid, s.lost, s.lost_streak, s.nack, s.timeouts,
         s.under, s.over, s.hit, s.goldilocks ? "true" : "false",
         s.best_delay, s.best_vdip, s.session, s.attempt, s.sequence,
         s.awaiting_verdict ? "true" : "false",

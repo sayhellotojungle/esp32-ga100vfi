@@ -26,6 +26,6 @@
 
 ## 3. 验证范围
 
-本页字段含义基于离线源码与替身回归（见 [TEST_RESULTS.md](TEST_RESULTS.md)）。0.3.0 的波形几何（`3 × 222 µs`、`gap 150 µs`、`td=-40 vr=750 tr=-20`、`delay=54`）已在实卡命中 Goldilocks 并完成 FF 烧写闭环（见 [UNLOCK_AND_POISON.md](UNLOCK_AND_POISON.md) §六）；板上未做模拟采样，波形级观测需外部示波器。历史项目中的固定延迟、标称样率与成功率描述不作为本版验证依据。
+本页字段含义基于离线源码与替身回归（逐版结果见 [../CHANGELOG.zh-CN.md](../CHANGELOG.zh-CN.md)）。档案波形几何（`3 × 222 µs`、`gap 150 µs`、`td=-40 vr=750 tr=-20`、`delay=54`）已在实卡命中 Goldilocks 并完成 FF 烧写闭环（见 [UNLOCK_AND_POISON.md](UNLOCK_AND_POISON.md) §六）；板上未做模拟采样，波形级观测需外部示波器。历史项目中的固定延迟、标称样率与成功率描述不作为本版验证依据。
 
 官方参考：[ESP-IDF 5.3 I²C](https://docs.espressif.com/projects/esp-idf/en/v5.3/esp32s3/api-reference/peripherals/i2c.html)。

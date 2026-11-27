@@ -1,6 +1,6 @@
 # 构建与运行
 
-本文给出可复现的构建入口。`firmware/` 附带 arduino-cli（Arduino-ESP32 3.3.11，`FlashSize=16M,PSRAM=opi`）交叉编译的 0.3.1 镜像；构建与验证范围见 [TEST_RESULTS.md](TEST_RESULTS.md)。
+本文给出可复现的构建入口。`firmware/` 附带 arduino-cli（Arduino-ESP32 3.3.11，`FlashSize=16M,PSRAM=opi`）交叉编译的镜像；版本、构建串与哈希以 `firmware/RELEASE.json` 为准，逐版验证结果见 [../CHANGELOG.zh-CN.md](../CHANGELOG.zh-CN.md)。
 
 所有命令默认在项目根目录执行。
 
@@ -24,7 +24,7 @@ python test/run_tests.py            # 需要本机有 C 编译器
 python test/run_tests.py --sanitizers
 ```
 
-该入口编译并运行本机 C 测试，同时运行 Python 单元测试。C 测试用的是项目内的 RTOS/外设替身，不能证明真实驱动、Wi-Fi 或电气时序正确。测试环境与具体结果统一记录在 [TEST_RESULTS.md](TEST_RESULTS.md)。
+该入口编译并运行本机 C 测试，同时运行 Python 单元测试。C 测试用的是项目内的 RTOS/外设替身，不能证明真实驱动、Wi-Fi 或电气时序正确。测试环境与实际结果按版本记在 [../CHANGELOG.zh-CN.md](../CHANGELOG.zh-CN.md)。
 
 没有 C 编译器的工作站（例如只装 Python 的 Windows）用同一条命令把测试输入打包送到有 gcc 的 Linux 机器（判决机）上跑，判据不变：
 

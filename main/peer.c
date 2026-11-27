@@ -193,17 +193,23 @@ void peer_render(char *out, int n)
 {
     if (!out || n <= 0) return;
     char info[PEER_INFO_MAX];
-    bool present, pending;
+    bool present, seen, pending;
     uint32_t seq, req_seq, resolved;
-    int64_t age, req_age;
+    int64_t age, age_us, req_age;
     const char *state;
 
     portENTER_CRITICAL(&s_mux);
     reap_locked(peer_now());
-    present = s_present;
+    seen = s_present;
+    /* Presence is computed, never latched: a judge that stopped talking is absent, and a
+     * field that keeps saying `true` after the process was killed makes every reader that
+     * trusts it (the page's "判决方" line first of all) state something false as fact. The
+     * snapshot stays, so the page can still show *why* it stopped. */
+    age_us = seen ? peer_now() - s_info_t : -1;
+    present = seen && age_us >= 0 && age_us <= PEER_STALE_US;
+    age = age_us >= 0 ? age_us / 1000000 : -1;      /* 给人看的秒；闸门用上面的微秒 */
     snprintf(info, sizeof info, "%s", s_info);
     seq = s_info_seq;
-    age = present ? (peer_now() - s_info_t) / 1000000 : -1;
     pending = s_req[0] != 0;
     req_seq = pending ? s_req_seq : (s_adopted ? s_adopted : s_expired);
     req_age = pending ? (peer_now() - s_req_t) / 1000000 : 0;
@@ -212,9 +218,12 @@ void peer_render(char *out, int n)
                                            : "none");
     portEXIT_CRITICAL(&s_mux);
 
+    /* `info` is gated on `seen`, not on `present`: the last snapshot of a judge that died
+     * is the only record of why it died. `seq == 0` is what tells a reader that nobody has
+     * ever spoken since this boot, as opposed to somebody who spoke and went quiet. */
     snprintf(out, (size_t)n,
              "{\"present\":%s,\"age_s\":%lld,\"seq\":%" PRIu32 ",\"req\":\"%s\","
              "\"req_seq\":%" PRIu32 ",\"req_age_s\":%lld,\"info\":%s}",
              present ? "true" : "false", (long long)age, seq, state, req_seq,
-             (long long)req_age, present ? info : "null");
+             (long long)req_age, seen ? info : "null");
 }

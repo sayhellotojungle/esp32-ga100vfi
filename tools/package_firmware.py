@@ -4,7 +4,9 @@ each published image to the firmware sources it was compiled from.
 
 usage:
     python tools/sync_arduino.py && arduino-cli compile --fqbn ... --build-path build-arduino arduino/ga100vfi
-    python tools/package_firmware.py --prune        # after a build
+    python tools/package_firmware.py --prune        # after a build; keeps anything git
+                                                    # tracks or the docs cite by hash --
+                                                    # old images are evidence, see protected()
     python tools/package_firmware.py --check        # publish gate: do the zips match the sources?
 
 The app image is what OTA accepts; the merged image is the one-shot serial flash at 0x0.
@@ -93,19 +95,73 @@ def git_state():
                               ":(exclude)firmware", ":(exclude)MANIFEST.sha256"))}
 
 
+def cited_digests():
+    """Digests the written record points at, as full hashes and 16-char prefixes.
+
+    The bench quotes an image's hash in prose whenever a run is argued from it ("这块镜像
+    sha=be9d24ce…"), and those sentences are how a later reader knows which build produced a
+    given ledger. A hash that appears in the docs has become evidence."""
+    texts = []
+    for pattern in ("docs/*.md", "bench/*.md", "firmware/RELEASE.json"):
+        for path in ROOT.glob(pattern):
+            texts.append(path.read_text(encoding="utf-8", errors="replace"))
+    blob = "\n".join(texts)
+    found = set()
+    for token in re.findall(r"\b[0-9a-f]{16,64}\b", blob):
+        found.add(token)
+        if len(token) > 16:
+            found.add(token[:16])
+    return found
+
+
+def protected(path):
+    """Why this image may not be pruned, or None when it really is just clutter.
+
+    --prune used to delete whatever wasn't the current version, and on 2026-11-26 it erased
+    the 0.5.5 image -- the exact build that fired that day's 120 shots, whose sources are
+    still uncommitted, so the binary was the only copy. The 0.5.2 pair survived only because
+    git happens to track those two files, which is the accident this now codifies: an image
+    somebody chose to keep, or that the written record cites by hash, is not build residue.
+    """
+    try:
+        rel = path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return None
+    if subprocess.run(["git", "ls-files", "--error-unmatch", rel], cwd=ROOT,
+                      capture_output=True).returncode == 0:
+        return "tracked by git (somebody committed this build)"
+    try:
+        with zipfile.ZipFile(path) as zf:
+            digest = hashlib.sha256(zf.read(zf.namelist()[0])).hexdigest()
+    except (zipfile.BadZipFile, KeyError, IndexError):
+        return "unreadable zip (not pruning what we cannot inspect)"
+    cited = cited_digests()
+    if digest in cited or digest[:16] in cited:
+        return "its hash is cited by docs/ or RELEASE.json (evidence, not residue)"
+    return None
+
+
 def package(version, build, out, prune):
     out.mkdir(parents=True, exist_ok=True)
     if not build.is_dir():
         raise SystemExit(f"{build} is not a build directory; compile first")
     record = {"version": version, "images": {}, "source": {}, "git": git_state()}
-    app_bytes = None
+    # 先把镜像**全部读进来并验完版本**，再往 firmware/ 落盘。旧顺序是边写边验：编译目录还是
+    # 上一版的构建时，它会先留下两个以新版本号命名、装的却是旧版本字节的 zip，然后在报错处退出
+    # ——RELEASE 里不会记它们，但 IMG= 的人眼看的就是文件名（2026-11-26 用 --output-dir build/056
+    # 编译、却按默认 --build-dir build-arduino 打包时就是这样：0.5.6-app.bin.zip 里是 0.5.5）。
+    blobs = {}
     for kind, src_name in IMAGES.items():
         src = build / src_name
         if not src.is_file():
             raise SystemExit(f"missing {src}: compile with --build-path {build.name} first")
-        raw = src.read_bytes()
-        if kind == "app":
-            app_bytes = raw
+        blobs[kind] = (src, src.read_bytes())
+    img_version, stamp = embedded_stamp(blobs["app"][1])
+    if img_version != version:
+        raise SystemExit(f"image says {img_version}, main/board.h says {version}: "
+                         "recompile (and tools/sync_arduino.py) before packaging — "
+                         f"并且确认 --build-dir 就是刚才 compile --build-path 的那个目录")
+    for kind, (src, raw) in blobs.items():
         bin_name = f"esp32-ga100vfi-{version}-{kind}.bin"
         dst = out / (bin_name + ".zip")
         with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -115,10 +171,6 @@ def package(version, build, out, prune):
                                   "zip_size": dst.stat().st_size, "zip_sha256": sha256(dst)}
         print(f"{dst.relative_to(ROOT)}  {len(raw):>9} B bin  {record['images'][kind]['zip_size']:>8} B zip")
 
-    img_version, stamp = embedded_stamp(app_bytes)
-    if img_version != version:
-        raise SystemExit(f"image says {img_version}, main/board.h says {version}: "
-                         "recompile (and tools/sync_arduino.py) before packaging")
     digest, files = source_digest()
     record["stamp"] = stamp
     record["source"] = {"sha256": digest, "files": len(files)}
@@ -129,9 +181,14 @@ def package(version, build, out, prune):
     if prune:
         keep = {f"esp32-ga100vfi-{version}-{k}.bin.zip" for k in IMAGES}
         for old in out.glob("esp32-ga100vfi-*.bin.zip"):
-            if old.name not in keep:
-                old.unlink()
-                print("pruned", old.relative_to(ROOT))
+            if old.name in keep:
+                continue
+            why = protected(old)
+            if why:
+                print(f"kept {old.relative_to(ROOT)} -- {why}")
+                continue
+            old.unlink()
+            print("pruned", old.relative_to(ROOT))
     return 0
 
 

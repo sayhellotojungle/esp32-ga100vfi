@@ -303,18 +303,45 @@ static void test_failed_writes_timeout_and_restore(void)
 
 static void test_lost_adaptation_and_unlimited_grid(void)
 {
+    /* A lost verdict used to be charged to `over`, which moved the ladder toward shallower
+     * dips while every remaining shot went out to a card that had left PCIe (campaign.c:267
+     * before 0.5.5; the archive rule "lost -> one more shot -> poison" (docs/UNLOCK_AND_POISON.md §四)). It may move nothing. */
     reset_fixture();
-    campaign_cfg_t c = manual_config(2);
+    campaign_cfg_t c = manual_config(4);
+    c.batch = 1;
+    const uint32_t start_vd = (uint32_t)c.vd;
+    CHECK(campaign_start(&c));
+    ready_verdict(); feed(ORACLE_LOST);
+    CHECK(number("lost") == 1 && number("over") == 0 && number("valid") == 0);
+    CHECK(number("v_dip") == start_vd);                 // the ladder is frozen on a lost
+    CHECK(number("lost_streak") == 1);
+    CHECK(campaign_is_running());                       // once is a warning, not an end
+    ready_verdict(); feed(ORACLE_LOST);
+    CHECK(number("over") == 0);                         // and it never became an `over`
+    CHECK(!campaign_is_running() && phase("lost"));     // twice at one point: stop grinding
+    campaign_poll();
+
+    /* The streak rule needs its own shape: one lost per point, so no point ever reaches its
+     * own limit and only the campaign-wide streak can end the batch. */
+    reset_fixture();
+    c = manual_config(3); c.ndelays = 3;
+    c.delays[0] = 60; c.delays[1] = 70; c.delays[2] = 80;
     c.batch = 1;
     CHECK(campaign_start(&c));
     ready_verdict(); feed(ORACLE_LOST);
-    CHECK(number("lost") == 1 && number("nack") == 0 && number("valid") == 0);
-    CHECK(number("v_dip") == (uint32_t)(c.vd + c.step));
-    campaign_stop(); campaign_poll();
+    CHECK(number("lost_streak") == 1 && campaign_is_running());
+    ready_verdict(); feed(ORACLE_LOST);
+    CHECK(number("lost_streak") == 2 && campaign_is_running());
+    ready_verdict(); feed(ORACLE_LOST);
+    CHECK(!campaign_is_running() && phase("lost") && number("over") == 0);
+    CHECK(executions == 3);                             // the fourth shot was never fired
+    campaign_poll();
 
+    /* Grid rotation. min_v==max_v on purpose: that is the hammer mode (the standing firing
+     * order is exactly this shape), so the only thing moving here is the delay. */
     reset_fixture();
     c = manual_config(0); c.ndelays = 2; c.delays[0] = 60; c.delays[1] = 90;
-    c.batch = 1;
+    c.batch = 1; c.min_v = c.max_v = c.vd;
     CHECK(campaign_start(&c));
     for (int i = 0; i < 41; i++) {
         ready_verdict(); feed(ORACLE_UNDER);
@@ -322,8 +349,44 @@ static void test_lost_adaptation_and_unlimited_grid(void)
     CHECK(executions == 41);
     CHECK(executed[0].delay == 60 && executed[19].delay == 60);
     CHECK(executed[20].delay == 90 && executed[39].delay == 90);
-    CHECK(executed[40].delay == 60 && executed[40].vd == c.min_v);
+    CHECK(executed[40].delay == 60 && executed[40].vd == c.vd);   // hammer: never moves
     campaign_stop(); campaign_poll();
+}
+
+/* The physical coordinate is the PMBus code, not the millivolt: VOUT_COMMAND's LSB is
+ * 6.25 mV, so the 2 mV ladder of 2026-11-21's hit replica (372/370/368/366) fired codes
+ * 60/59/59/59 — three shots spent, two coordinates covered. From 0.5.5 a move is at least one
+ * code, and a code this point already judged is never fired again. */
+static void test_ladder_walks_codes_not_millivolts(void)
+{
+    reset_fixture();
+    campaign_cfg_t c = manual_config(0);                 // unlimited: run the band out
+    c.batch = 1; c.step = 2;                             // the ladder that used to repeat
+    c.vd = 372; c.min_v = 366; c.max_v = 380;            // codes 59,60,61 = 3 coordinates
+    CHECK(campaign_start(&c));
+    int seen[8] = { 0 }, n = 0;
+    while (campaign_is_running() && n < 8) {
+        ready_verdict();
+        seen[n++] = glitch_mv_to_code(executed[executions - 1].vd);
+        feed(ORACLE_OVER);                               // always "too deep": walk shallower
+    }
+    CHECK(n == 3);                        /* three codes, three shots — not eight */
+    CHECK(seen[0] == 60 && seen[1] == 61);
+    CHECK(seen[0] != seen[1] && seen[1] != seen[2] && seen[0] != seen[2]);
+    CHECK(!campaign_is_running() && phase("exhausted"));  // the band is done; say so
+    CHECK(number("codes_tried") == 3);
+
+    /* The same band, but the operator asked for one coordinate: exhausting it is not an
+     * answer. VD=MINV=MAXV is the hammer and must run to its attempt cap. */
+    reset_fixture();
+    c = manual_config(6);
+    c.batch = 1; c.step = 2; c.vd = c.min_v = c.max_v = 372;
+    CHECK(campaign_start(&c));
+    for (int i = 0; i < 6; i++) { ready_verdict(); feed(ORACLE_OVER); }
+    CHECK(executions == 6 && !campaign_is_running() && phase("limit"));
+    for (int i = 0; i < 6; i++)
+        CHECK(executed[i].vd == 372 && glitch_mv_to_code(executed[i].vd) == 60);
+    CHECK(number("codes_tried") == 1 && number("v_code") == 60);
 }
 
 static void test_config_validation_and_busy(void)
@@ -391,6 +454,7 @@ int main(void)
     test_stop_paths();
     test_failed_writes_timeout_and_restore();
     test_lost_adaptation_and_unlimited_grid();
+    test_ladder_walks_codes_not_millivolts();
     test_config_validation_and_busy();
 #ifdef CAMPAIGN_TEST_THREADS
     test_concurrent_starts();

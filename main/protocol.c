@@ -112,6 +112,8 @@ bool ga_campaign_options(const char *args, campaign_cfg_t *cfg, char *error, siz
             if (v != 1) goto bad_mode;
         }
         else if (!strcmp(tk, "wait")) next.restore_wait_ms = v;
+        else if (!strcmp(tk, "swin")) next.swin = v;
+        else if (!strcmp(tk, "revert")) next.revert = v;
         else goto bad;
     }
     *cfg = next; if (error && error_size) error[0] = 0; return true;

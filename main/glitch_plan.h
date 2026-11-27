@@ -12,7 +12,13 @@
 #define GLITCH_MAX_MV 1000
 #define GLITCH_MAX_PULSES 16
 #define GLITCH_MAX_TIME_US 1000000
-#define GLITCH_MAX_HOLD_MS 10000
+/* 0.5.5: 10 s -> 1 s. A timeline that stops the clock longer than a few tens of ms makes an
+ * SMBus slave abort its transaction and come back holding SDA, which is the one failure this
+ * bench cannot tell apart from a fired shot: the write still reports wfail=0. Nothing in any
+ * campaign uses hold (campaign.c pins hold_ms=0; test/test_main.c uses 2 ms to prove the bus
+ * comes back), so the only honest ceiling is "long enough to be a diagnostic, too short to
+ * wedge the bus". It stays out of timing strategies. */
+#define GLITCH_MAX_HOLD_MS 1000
 #define GLITCH_MAX_SAMPLE_US 20000
 #define GLITCH_MAX_DURATION_US 15000000
 
@@ -30,7 +36,37 @@ enum {
     GA_CLR     = 10,  // CLEAR_FAULTS (0x03) — drop latched UVP/OCP first
 };
 
-typedef struct { int32_t t_us; uint8_t act; int32_t arg; } gstep_t;
+/* flags：目前只有 GA_ANCHOR。它标的是**整个波形里唯一一件真正发生了的事**——坑的第一笔写
+ * 落到总线上的那一刻。为什么需要它（2026-11-26 逐 act 原文实测，两批 5 发同一形状）：
+ * 卡在被拉住复位时会拉伸 SCL，所以那笔 16-bit 写的实际耗时是 114/211/223/309 µs（计划值 36 µs），
+ * 而它后面每一步都排在这笔写**后面**，于是整条波形被整体推后 13~219 µs。更糟的是"坑开始"跟着
+ * 漂而"坑结束"仍钉在原计划时刻上，于是**坑的实际长度**在 108~202 µs 之间随机（配方写的是 222）。
+ * 也就是说"同一发打 60 次"在物理上不是 60 个相同实验，是 60 个不同深度的坑。
+ * 打了 GA_ANCHOR 的那一步执行完之后，运行器把**后面所有步**按它的迟到量整体平移（见 main.c 的
+ * GA_REANCHOR），于是 pw/gap/td 这些相对关系第一次真正成立。释放沿与坑的相对关系本来就紧
+ * （实测 +3~+7 µs），平移只是把这份紧从"意外"变成"定义"。 */
+#define GA_ANCHOR 0x01      /* 坑的第一笔 VOUT 写：后面的步以它为准 */
+
+typedef struct { int32_t t_us; uint8_t act; int32_t arg; uint8_t flags; } gstep_t;
+
+/* ---- The only coordinate that physically exists: the PMBus code ----
+ *
+ * VOUT_COMMAND is Linear11 ULINEAR with a 6.25 mV LSB, so a commanded millivolt is only ever
+ * realisable as round(mv*16/100). Two millivolt numbers that round to the same code are the
+ * *same* physical shot: measured against the first 0x8b rail samples on 2026-11-26,
+ * 366/368/370 all -> code 59 and 372/374/376/378 all -> code 60. The 2 mV ladder of the
+ * 2026-11-21 hit replica fired three of its eight shots at a coordinate it had already
+ * fired, and the whole 300..380 mV band is 14 coordinates, not 81.
+ *
+ * Anything that searches depth searches codes (campaign.c's ladder); anything that reports a
+ * coordinate reports the code beside it (board status, host agent, bench ledger).
+ */
+#define GLITCH_MV_PER_CODE_NUM 16   /* code = (mv * 16 + 50) / 100 */
+#define GLITCH_MV_PER_CODE_DEN 100
+
+int glitch_mv_to_code(int mv);                  /* the rounding the timeline itself uses */
+int glitch_code_to_mv(int code);                /* nearest mV that maps back to this code */
+int glitch_codes_apart(int mv_a, int mv_b);     /* 0 => the same physical shot */
 
 typedef struct {
     int vd, td, vr, tr, tv;

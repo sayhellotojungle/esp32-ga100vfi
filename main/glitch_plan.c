@@ -7,8 +7,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-// VOUT_COMMAND: 6.25 mV/LSB, with a wide intermediate.
-static int mv_to_code(int mv) { return (int)(((int64_t)mv * 16 + 50) / 100); }
+/* VOUT_COMMAND: 6.25 mV/LSB. Public because a search that steps in millivolts can step twice
+ * through the same physical coordinate — see glitch_plan.h. The timeline below and the
+ * campaign ladder must agree on this one rounding, so there is exactly one definition. */
+int glitch_mv_to_code(int mv) { return (int)(((int64_t)mv * 16 + 50) / 100); }
+
+/* Nearest millivolt that rounds back to `code`: (code*100+8)/16. glitch_mv_to_code() of this
+ * value is `code` for every code in the legal range, which is what makes it safe to store a
+ * ladder position as millivolts at all (test/test_campaign.c pins it). */
+int glitch_code_to_mv(int code) { return (int)(((int64_t)code * 100 + 8) / 16); }
+
+int glitch_codes_apart(int mv_a, int mv_b) { return glitch_mv_to_code(mv_a) - glitch_mv_to_code(mv_b); }
+
+static int mv_to_code(int mv) { return glitch_mv_to_code(mv); }
 
 void glitch_args_defaults(glitch_args_t *a)
 {
@@ -71,7 +82,7 @@ bool glitch_args_validate(const glitch_args_t *a, char *error, size_t n)
     if (!within(a->pulses, 1, GLITCH_MAX_PULSES))
         return invalid(error, n, "pulses must be 1..16");
     if (!within(a->hold_ms, 0, GLITCH_MAX_HOLD_MS))
-        return invalid(error, n, "hold must be 0..10000 ms");
+        return invalid(error, n, "hold must be 0..1000 ms (GLITCH_MAX_HOLD_MS)");
     if (!within(a->swin, 0, GLITCH_MAX_SAMPLE_US))
         return invalid(error, n, "sample window must be 0..20000 us");
 
@@ -129,7 +140,7 @@ void glitch_args_finalize(glitch_args_t *a, uint32_t pmbus_write_us)
 static bool append(gstep_t *st, int *ns, int64_t t, uint8_t act, int arg)
 {
     if (*ns >= GLITCH_MAX_STEPS || t < INT32_MIN || t > INT32_MAX) return false;
-    st[(*ns)++] = (gstep_t){ (int32_t)t, act, arg };
+    st[(*ns)++] = (gstep_t){ (int32_t)t, act, arg, 0 };   // flags 由调用方按需再置位（GA_ANCHOR）
     return true;
 }
 
@@ -157,6 +168,7 @@ int glitch_build(const glitch_args_t *a, gstep_t *st, int max_steps, int32_t *ou
     int64_t t = (int64_t)a->td - a->delay;
     for (int p = 0; p < a->pulses; p++) {
         ADD(t, GA_VOUT, mv_to_code(a->vd));
+        if (p == 0) plan[ns - 1].flags |= GA_ANCHOR;   // 见 glitch_plan.h 的 GA_ANCHOR
         train_end = t + a->pw;
         ADD(train_end, GA_VOUT, mv_to_code(a->vr));
         t += (int64_t)a->pw + a->gap;

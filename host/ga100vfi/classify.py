@@ -16,7 +16,7 @@ Before any of that, one question to the fuse controller (安全红线 1). It has
 not two: IDLE may proceed, all-FF is "the card left PCIe" (a `lost`, keep the ladder
 running), 0xBADFxxxx is a trip, and anything else -- the 0x00000000 measured at vd=309, a
 transient state caught mid-command -- is a state we cannot name, so we neither judge nor
-fire again. See fusectrl_state() and docs/UNLOCK_AND_POISON.md §己.
+fire again. See fusectrl_state() and docs/UNLOCK_AND_POISON.md §四.
 """
 from __future__ import annotations
 

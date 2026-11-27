@@ -86,7 +86,7 @@ def tracked(prefix):
     return [f for f in out if "__pycache__" not in f and not f.endswith(".pyc")]
 
 
-# Not under host/ or bench/, but required by README §1.4 on the judging host: capture 路径
+# Not under host/ or bench/, but required by README §2.4 on the judging host: capture 路径
 # 出的快照没有 fingerprint，`ffcalc verify`（认卡闸门）会直接 FAIL，没有这个工具就补不了身份。
 EXTRA_FILES = ["tools/attach_identity.py"]
 
@@ -95,7 +95,7 @@ def make_tar(path):
     files = tracked("host") + tracked("bench") + EXTRA_FILES
     for f in EXTRA_FILES:
         if not (REPO / f).exists():
-            sys.exit(f"{f} 不在仓库里：§1.4 的认卡闸门（ffcalc verify）在判决机上跑不起来")
+            sys.exit(f"{f} 不在仓库里：README §2.4 的认卡闸门（ffcalc verify）在判决机上跑不起来")
     if not files:
         sys.exit("nothing to pack: is this a git checkout with host/ and bench/?")
     with tarfile.open(path, "w:gz") as tf:
@@ -133,6 +133,32 @@ def remote_home(c):
     return out
 
 
+def check_policy():
+    """每发的节奏与配方必须有唯一出处，而且那个出处要在部署包裡。
+
+    这一步在打包之前跑，因为它拒绝的是"这一批根本不该打"：判决机上那层入口以前自带
+    CARD_SETTLE_S=25 / REV=1 / SWIN=1200（仓库改了不生效、批次悄悄不是同一发），而 crack.sh
+    现在直接问 shot_policy 要数 —— 文件不在或值被写死在别处，开火就会拿不到规程（SP 会拒绝开火），
+    最坏是拿一份旧默认值跑掉一个电源周期。让它在部署时就炸。
+    """
+    py = sys.executable
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    # encoding 必须写死：Windows 上 text=True 会按本地代码页（这里 gbk）解 stdout，规程表里的中文
+    # 直接把读线程炸掉、r.stdout 变成 None（症状是"部署器 TypeError"，跟规程本身无关）。
+    kw = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+    r = subprocess.run([py, "-m", "ga100vfi.shot_policy", "--check-scripts", str(REPO)],
+                       cwd=REPO / "host", **kw)
+    sys.stdout.write(r.stdout or "")
+    if r.returncode:
+        sys.stderr.write(r.stderr or "")
+        sys.exit("规程自检不过（上面那几行）：把这些写死值改回从 shot_policy 取值，再来部署")
+    r = subprocess.run([py, "-m", "ga100vfi.shot_policy", "--get", "card_settle_s"],
+                       cwd=REPO / "host", **kw)
+    if r.returncode or not r.stdout.strip():
+        sys.exit("shot_policy 读不出 card_settle_s（键名或文件坏了）：不开火")
+    print(f"   [ok] 规程可读、别处无写死值（card_settle_s={r.stdout.strip()}）")
+
+
 def main():
     if not HOST:
         sys.exit("BENCH_HOST is required (set BENCH_HOST=<判决机IP>). The repo deliberately "
@@ -140,6 +166,7 @@ def main():
     if not PW:
         sys.exit("BENCH_PW is required: the bench password is not stored in the repo")
     check_versions()
+    check_policy()
     tar = Path(os.environ.get("TEMP", "/tmp")) / "ga100vfi-bench.tar.gz"
     make_tar(tar)
 
@@ -173,16 +200,26 @@ for f in console crack window mkledger poison_check card_probe link_retrain; do
     > /tmp/.$f.sh && chmod +x /tmp/.$f.sh
 done
 echo "== 自检：bash -n 语法 =="
-for f in {prefix}/bench/*.sh; do
+for f in {prefix}/bench/*.sh {prefix}/bench/judge-entry/*.sh; do
   bash -n "$f" || {{ echo "!! 语法错误 $f"; exit 7; }}
 done
-echo "   [ok] 全部脚本语法通过"
+echo "   [ok] 全部脚本语法通过（含 judge-entry：判决机外壳现在也在仓库里）"
+echo "== 自检：每发的节奏与配方只有 shot_policy 一个出处 =="
+(cd {prefix}/host && python3 -m ga100vfi.shot_policy --check-scripts {prefix}) \
+  || {{ echo "!! 部署副本里有写死值、或入口层自带配方：这一批的数值来源不可信，禁止开火"; exit 7; }}
+(cd {prefix}/host && python3 -m ga100vfi.shot_policy --get card_settle_s >/dev/null) \
+  || {{ echo "!! crack.sh 要的规程键读不出来"; exit 7; }}
+grep -q 'SP()' {prefix}/bench/crack.sh \
+  || {{ echo "!! crack.sh 里那个取值函数没了：它会安静地依赖各自的默认值，第 6 个出处就是这么来的"; exit 7; }}
+test -f {prefix}/bench/judge-entry/batch.sh \
+  || {{ echo "!! 判决机外壳没装上（还在 /root/mig-card2 里那份？）"; exit 7; }}
+echo "   [ok] 规程闸门通过"
 echo "== 自检：红线 1 的防护必须在场 =="
 # 措辞要能同时适合两棵树：0.2.x 用 require_unpoisoned()，2f385b0 树直接在 classify() 里
 # raise Poisoned。检查的是「防护存在」而不是「防护叫什么名字」。
 grep -q Poisoned {prefix}/host/ga100vfi/classify.py || {{ echo "!! classify 里没有 Poisoned"; exit 7; }}
 grep -q 0xBADF0000 {prefix}/host/ga100vfi/classify.py || {{ echo "!! classify 里没有 FUSECTRL poison 判据"; exit 7; }}
-# 第三种态（实测 0x00000000）比 poison 更早出现，判据缺了它等于没有：见 §七乙。
+# 第三种态（实测 0x00000000）比 poison 更早出现，判据缺了它等于没有：见 docs/UNLOCK_AND_POISON.md §四。
 grep -q STATE_UNKNOWN {prefix}/host/ga100vfi/classify.py || {{ echo "!! classify 里没有第三种态判据"; exit 7; }}
 grep -q 'delay=' {prefix}/host/ga100vfi_agent.py || {{ echo "!! 判决行不带坐标，跨轮台账会瞎"; exit 7; }}
 # BAR0 闸门（bar0.require_mapped）：映射之前必须先用只读证据确认"桥的链路层活着 + device
@@ -195,7 +232,7 @@ grep -q 'def require_mapped' {prefix}/host/ga100vfi/bar0.py || {{ echo "!! bar0.
 grep -q 'Bar0Unavailable' {prefix}/host/ga100vfi_agent.py || {{ echo "!! agent 不认 Bar0Unavailable：闸门一拦就变异常，判决落不了盘"; exit 7; }}
 # 开火入口必须检查板上固件版本，否则这一轮日志无法回答"哪版固件打的"。
 grep -q 'EXPECT_FW=' {prefix}/bench/crack.sh || {{ echo "!! crack.sh 没有固件版本闸门"; exit 7; }}
-# §1.4 的认卡闸门：capture 快照没有 fingerprint，ffcalc verify 会 FAIL。缺这个工具，
+# README §2.4 的认卡闸门：capture 快照没有 fingerprint，ffcalc verify 会 FAIL。缺这个工具，
 # 现场只剩两种坏选择——跳过 verify，或手搓一个哈希（输入集不同则与规范不可比）。
 test -f {prefix}/tools/attach_identity.py || {{ echo "!! 缺 tools/attach_identity.py：verify 闸门补不了身份"; exit 7; }}
 grep -q ingest.fingerprint {prefix}/tools/attach_identity.py || {{ echo "!! attach_identity 没调用 ffcalc 自己的指纹算法"; exit 7; }}

@@ -108,6 +108,46 @@ static void test_snapshot_rules(void)
     CHECK(render_field("present", "true"));
 }
 
+static void test_heartbeat_expires(void)
+{
+    /* The rule this file's own header promised ("a heartbeat that goes stale") and the
+     * implementation never had: `s_present` used to latch on the first `@A`, so a board
+     * whose judge had been killed kept answering `present:true` forever. Measured on the
+     * bench 2026-11-26: agent stopped, and 6 s later /api/status still said present=true,
+     * age_s=6. The page keys its 判决方 line off that field, so the field itself had to
+     * stop lying -- and the snapshot must NOT age out with it, because a dead judge's
+     * `halt` is the only surviving account of why it stopped. */
+    reset();
+    CHECK(peer_store("{\"halt\":\"presence\"}", 41, error, sizeof error));
+    fake_now = PEER_STALE_US - 1;
+    CHECK(render_field("present", "true"));      // one step inside the window
+    CHECK(render_field("age_s", "4"));
+    CHECK(strstr(out, "\"info\":{\"halt\":\"presence\"}") != NULL);
+
+    fake_now = PEER_STALE_US + 1;
+    CHECK(render_field("present", "false"));     // same snapshot, now a stale claim
+    CHECK(render_field("age_s", "5"));
+    CHECK(render_field("seq", "41"));            // the snapshot itself is kept...
+    CHECK(strstr(out, "\"info\":{\"halt\":\"presence\"}") != NULL);   // ...including the reason
+
+    // A fresh heartbeat revives presence: the page must not need a reboot to recover.
+    fake_now = PEER_STALE_US + 10000000;
+    CHECK(render_field("present", "false"));
+    CHECK(peer_store("{\"halt\":\"presence\"}", 42, error, sizeof error));
+    CHECK(render_field("present", "true"));
+    CHECK(render_field("seq", "42"));
+    CHECK(render_field("age_s", "0"));
+
+    // 从没说过话 ≠ 说过之后断了：这两个状态操作员查的方向完全不同（agent 没起 / agent 退了），
+    // 分开它们的依据就是闩锁的 seq 是否为 0。
+    reset();
+    peer_render(out, sizeof out);
+    CHECK(render_field("present", "false"));
+    CHECK(render_field("seq", "0"));
+    CHECK(render_field("age_s", "-1"));
+    CHECK(strstr(out, "\"info\":null") != NULL);
+}
+
 static void test_request_lifecycle(void)
 {
     reset();
@@ -171,6 +211,7 @@ int main(void)
 {
     test_empty_board_reports_honesty();
     test_snapshot_rules();
+    test_heartbeat_expires();
     test_request_lifecycle();
     test_adoption_outranks_expiry();
     printf("peer: %d checks, %d failures\n", checks, failures);

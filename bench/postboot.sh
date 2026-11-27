@@ -48,7 +48,7 @@ print("   CRC=%s（必须 0x55）  FUSEDEBUG=%s（必须 0）" % (fmt(crc), fmt(
 print("   FUSECTRL=%s  DSOV=%s" % (fmt(ctrl), fmt(dsov)))
 bad = []
 if crc != 0x55:
-    bad.append("CRC 不是 0x55：熔丝链 boot 后校验不过，先别再烧，按 §2.3 恢复顺序处理")
+    bad.append("CRC 不是 0x55：熔丝链 boot 后校验不过，先别再烧，按 docs/UNLOCK_AND_POISON.md §四 的恢复顺序处理")
 if dbg != 0:
     bad.append("FUSEDEBUG 非 0：熔丝块自己报了错")
 if ctrl is not None and (ctrl & 0xFFFF0000) == 0xBADF0000:
@@ -62,9 +62,11 @@ rcA=$?
 
 if [ -n "${SNAP:-}" ] && [ -f "$SNAP" ]; then
   echo "== B. 重读 FF 区，与烧前快照逐行比（熔丝保住了没）=="
-  python3 -m ga100vfi.burn --bdf "$BDF" capture -o "$OUT/snapshot-boot.json" >/dev/null
+  # 存成 rows.txt（不是 json）：同一份读既给这里的 diff 用，也给下面 D 的 ffcalc 当 --ffrows，
+  # 冷启动之后不必为了第二套实现再花 2~3 min 重读一遍。
+  python3 -m ga100vfi.burn --bdf "$BDF" capture -o "$OUT/rows-boot.txt" >/dev/null
   cp "$SNAP" "$OUT/"
-  python3 -m ga100vfi.burn diffrows "$SNAP" "$OUT/snapshot-boot.json" ${PLAN:+--plan "$PLAN"} \
+  python3 -m ga100vfi.burn diffrows "$SNAP" "$OUT/rows-boot.txt" ${PLAN:+--plan "$PLAN"} \
     2>&1 | tee "$OUT/diff.txt"
   [ -n "${PLAN:-}" ] && grep -q '结论：只有计划内的行按记录改变' "$OUT/diff.txt" \
     && echo "   B 通过：冷启动后逐行仍然是「只烧了计划内的那些行」"
@@ -98,6 +100,28 @@ else:
 print("   [已知未闭合] 影子口径的 SM 数与 ffcalc analysis 的 sm_count 相差 4（缺陷位口径不同），"
       "引用 SM 数时必须写清是哪一个。")
 PY
+echo "== C2. 媒体引擎与 MIG：用 ffcalc 那套独立实现读（地址表不与本仓库共用）=="
+# 为什么值得多这一步：本仓库的 SHADOW 只盯 GPC/FBP/FBPA（那是判窗口与 poison 用的），
+# 而这次烧的正是 NVDEC/NVJPG/OFA 三位。它们的现场读法用 ffcalc：`gen --mig` 剩余必须是
+# 0 条（= 记录都按目标落地），且引擎报告要读成 5/5、1/1、1/1（STATUS_OPT_* == OPT_DISABLE 在
+# boot 之后仍然成立才算真放出，不是 CMD_SENSE 那一刻的临时值）。
+if [ -n "${FFCALC:-}" ] && [ -d "$FFCALC/ffcalc" ]; then
+  ROWS_ARG="$OUT/rows-boot.txt"
+  [ -f "$ROWS_ARG" ] || ROWS_ARG=
+  # 用 gen 而不是 report：要的那句判据是「剩余计划 0 条」，只有 gen 会算并打出来。
+  # verify 这一步在这里会报 `plan has no uuid/fingerprint`（capture 通道不写指纹），那是快照没身份
+  # 而不是卡不对；要跑 verify 就先对这份 dump 走一遍 tools/attach_identity.py。
+  ( cd "$FFCALC" && PYTHONPATH=$FFCALC python3 -m ffcalc.capture --bdf "$BDF" ${ROWS_ARG:+--ffrows "$ROWS_ARG"} \
+      -o "$OUT/postboot-dump.json" >/dev/null \
+    && PYTHONPATH=$FFCALC python3 -m ffcalc gen "$OUT/postboot-dump.json" -o "$OUT/plan-post.json" --mig ) \
+    2>&1 | tee "$OUT/ffcalc.txt" | grep -E -e 'planned [0-9]+ FF' -e potential -e 'NVDEC|NVJPG|OFA|SYS_PIPE'
+  grep -q 'planned 0 FF record(s)' "$OUT/ffcalc.txt" \
+    && echo "   C2 通过：剩余计划 0 条 ⇒ 计划内每位熔丝都按目标落地" \
+    || echo "   [!!] C2：剩余计划不是 0 条，看 $OUT/ffcalc.txt"
+else
+  echo "   跳过：没给 FFCALC=<ffcalc 仓库根>。这一步缺了就只剩影子寄存器，看不到 NVDEC/NVJPG/OFA。"
+fi
+
 echo
 echo "证据目录：$OUT   A 的退出码：$rcA"
 echo "提示：boot 后窗口按预期关闭；要再打毛刺重新开一役（bench/crack.sh），不是在已烧完的卡上重试。"

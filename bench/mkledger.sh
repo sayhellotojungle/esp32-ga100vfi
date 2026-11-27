@@ -40,7 +40,7 @@ for log in runs:
     # known, and "this parameter set can trip poison" is key data.
     #
     # 坐标取自板子（该轮 final.json 的 campaign.delay / v_dip），不是"最后一条判决"的坐标：
-    # BATCH=1 时每发换一档电压，最后一条判决属于上一发。2026-11-20 第二张卡两条台账都记成
+    # BATCH=1 时每发换一档电压，最后一条判决属于上一发。2026-11-20 那一轮两条台账都记成
     # 339 poison，而板子停在 v_dip=334 —— 差的那一个 PMBus 码正是我们用来夹边界的那个数。
     # 与 bench/crack.sh 的补行逻辑同源，两处必须一起改，否则重建台账会把错坐标写回来。
     if "POISON" in body and found:
@@ -56,7 +56,7 @@ for log in runs:
             print(f"  [!!] {run}: final.json 不可用（{type(exc).__name__}），"
                   f"poison 坐标退回最后一条判决 —— 该轮的 (delay, vd) 要人工核对")
         # 去重比较的是 4 元组 (run, d, v, "poison") 而左边只有 3 项 —— 永远不相等，于是
-        # 每条 agent.log 里的 `-> poison` 都会被再补记一遍（docs/UNLOCK_AND_POISON §2.4.1
+        # 每条 agent.log 里的 `-> poison` 都会被再补记一遍（docs/UNLOCK_AND_POISON.md §八
         # 记的那条台账翻倍就是这个）。补行的用途是"判决从没产生过"的发数，已经有就别补。
         if not (rows and rows[-1][:3] == (run, d, v) and rows[-1][3] == "poison"):
             rows.append((run, d, v, "poison"))

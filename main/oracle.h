@@ -7,7 +7,7 @@
 // registers as SMBus block transfers to 0x3A on the same two wires as the VRM
 // and reproduced classify.py's five checks. That endpoint never answered on
 // this bench: `@P` and the direct DSOV read gave no reply four times out of four
-// (docs/UNLOCK_AND_POISON.md §2.4.1), so the board cannot see this GPU at all.
+// (docs/UNLOCK_AND_POISON.md §一), so the board cannot see this GPU at all.
 // A campaign started in that mode judged every shot LOST through a transport
 // that does not exist here, which is worse than not having the mode.
 #pragma once

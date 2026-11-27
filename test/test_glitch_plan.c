@@ -96,6 +96,38 @@ static void test_acceptance(void)
     }
 }
 
+/* 重锚用的那面旗（0.5.9）：只有坑的第一笔写被标，别的都不许标。
+ * 为什么值得钉住：整条波形的"物理零点"就是这个步的执行完成时刻，标错了地方等于把整发
+ * 平移错——而平移错在 timeline 表里看起来仍然"很准点"（因为 want 也一起平移了），
+ * 也就是说这个 bug 不会让表变难看，只会让几何悄悄换掉。必须有断言。 */
+static void test_anchor_flag(void)
+{
+    /* 冻结配方：vd=372 td=-40 vr=750 tr=-20 tv=0 pulses=2 pw=222 gap=150 delay=64 revert=0 */
+    gstep_t st[GLITCH_MAX_STEPS];
+    int32_t post = -1;
+    int ns = build(" 372 -40 750 -20 0 1 0 2 222 150 64 0", W400, st, &post);
+    CHECK(ns > 0);
+    check_sorted(st, ns);
+
+    int n_anchor = 0, anchor_at = -1, rel_at = -1;
+    for (int i = 0; i < ns; i++) {
+        if (st[i].flags & GA_ANCHOR) { n_anchor++; anchor_at = i; }
+        if (st[i].act == GA_RST_REL) rel_at = i;
+        CHECK(st[i].flags == 0 || st[i].act == GA_VOUT);   /* 只可能标在 VOUT 上 */
+    }
+    CHECK(n_anchor == 1);
+    CHECK(anchor_at >= 0 && st[anchor_at].arg == glitch_mv_to_code(372));
+    CHECK(st[anchor_at].t_us == -40 - 64);          /* 坑按计划提前 delay 那么多 */
+    CHECK(rel_at >= 0 && !(st[rel_at].flags & GA_ANCHOR));
+    CHECK(anchor_at < rel_at);                      /* 锚点在释放沿之前，否则释放沿会被自己平移 */
+
+    /* 第二发的坑不许再标：重锚只做一次，否则 pw 会被平移两次。 */
+    int dips = 0;
+    for (int i = 0; i < ns; i++)
+        if (st[i].act == GA_VOUT && st[i].arg == glitch_mv_to_code(372)) dips++;
+    CHECK(dips == 2);
+}
+
 /* Single-pulse default: auto pw/gap = tr-td = 80 -> floored to 90 at 400k. */
 static void test_autosize_and_floor(void)
 {
@@ -270,7 +302,14 @@ static void test_full_sample_window_and_hold_conflicts(void)
     CHECK(count_act(st, ns, GA_VOUT, 57) == 16);
     CHECK(count_act(st, ns, GA_VOUT, 120) == 16);
     check_sorted(st, ns);
-    const int holds[] = { 5, 500, 600, 10000 };
+    /* Ceiling is GLITCH_MAX_HOLD_MS=1000 since 0.5.5: an SMBus slave aborts a transaction
+     * whose clock is frozen for seconds, and the shot still reports writes_failed=0. */
+    const int holds[] = { 5, 500, 600, 1000 };
+    {
+        gstep_t rejected[GLITCH_MAX_STEPS];
+        int32_t dummy;
+        CHECK(build("354 -60 750 -20 0 1 1001 1 120 120 117 1 20000", W400, rejected, &dummy) < 0);
+    }
     for (unsigned h = 0; h < sizeof holds / sizeof holds[0]; h++) {
         char args[120];
         snprintf(args, sizeof args, "354 -60 750 -20 0 1 %d 1 120 120 117 1 20000", holds[h]);
@@ -289,6 +328,39 @@ static void test_full_sample_window_and_hold_conflicts(void)
         CHECK(mode > release);
         if (holds[h] < 500) CHECK(mode == post + 500000);
     }
+}
+
+/* VOUT_COMMAND's LSB is 6.25 mV, so a commanded millivolt only exists through its code.
+ * This is the arithmetic behind the 2026-11-26 review: the "2 mV ladder" of the 2026-11-21
+ * hit replica (372/370/368/366) was three shots at two coordinates, and the 300..380 mV band
+ * the campaign searches is 14 coordinates, not 81. */
+static void test_code_grid(void)
+{
+    CHECK(glitch_mv_to_code(366) == 59);
+    CHECK(glitch_mv_to_code(368) == 59);
+    CHECK(glitch_mv_to_code(370) == 59);
+    CHECK(glitch_mv_to_code(372) == 60);
+    CHECK(glitch_mv_to_code(378) == 60);
+    CHECK(glitch_mv_to_code(380) == 61);
+    CHECK(glitch_codes_apart(366, 370) == 0);                 /* the same physical shot */
+    CHECK(glitch_codes_apart(372, 366) == 1);
+    CHECK(glitch_mv_to_code(380) - glitch_mv_to_code(300) == 13);   /* 14 codes in the band */
+
+    /* code_to_mv lands back on the code it came from, for every code the part can take.
+     * Without this the ladder cannot store a position as millivolts at all. */
+    for (int code = 0; code <= GLITCH_MAX_MV * GLITCH_MV_PER_CODE_NUM / GLITCH_MV_PER_CODE_DEN; code++)
+        CHECK(glitch_mv_to_code(glitch_code_to_mv(code)) == code);
+
+    /* The two must agree with the timeline itself: the code the plan puts on the bus for a
+     * commanded mV is the code the ladder names that mV. */
+    gstep_t st[GLITCH_MAX_STEPS];
+    int32_t post;
+    const int ns = build("372 -40 750 -20 0 1 0 2 222 150 64 0", W400, st, &post);
+    CHECK(ns > 0);
+    int seen = -1;
+    for (int i = 0; i < ns; i++)
+        if (st[i].act == GA_VOUT && st[i].arg == glitch_mv_to_code(372)) seen = i;
+    CHECK(seen >= 0);
 }
 
 static void test_no_silent_pulse_retiming(void)
@@ -313,6 +385,7 @@ static void test_no_silent_pulse_retiming(void)
 int main(void)
 {
     test_write_cost();
+    test_anchor_flag();
     test_acceptance();
     test_autosize_and_floor();
     test_pulses_limit_16();
@@ -323,6 +396,7 @@ int main(void)
     test_capacity_is_atomic();
     test_full_sample_window_and_hold_conflicts();
     test_no_silent_pulse_retiming();
+    test_code_grid();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

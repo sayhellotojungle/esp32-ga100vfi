@@ -376,7 +376,10 @@ static esp_err_t uri_req(httpd_req_t *r)
 static char s_status_buf[3072];
 static esp_err_t uri_status(httpd_req_t *r)
 {
-    char board[768], camp[768], peer[512], ip[16];
+    /* 1152, not 768: board_status_json's `last` memo grew the two post-shot status registers
+     * in 0.5.5 and the whole object degrades to "{}" if the snprintf is truncated. The 3 KB
+     * response buffer below still holds net+board+campaign+peer with room. */
+    char board[1152], camp[768], peer[512], ip[16];
     board_status_json(board, sizeof board);
     campaign_status_json(camp, sizeof camp);
     peer_render(peer, sizeof peer);
@@ -461,6 +464,7 @@ static esp_err_t uri_campaign(httpd_req_t *r)
         !qint(qs, "minv", &cfg.min_v) || !qint(qs, "maxv", &cfg.max_v) ||
         !qint(qs, "step", &cfg.step) || !qint(qs, "pw", &cfg.pw) ||
         !qint(qs, "gap", &cfg.gap) || !qint(qs, "pulses", &cfg.pulses) ||
+        !qint(qs, "swin", &cfg.swin) || !qint(qs, "revert", &cfg.revert) ||
         !qint(qs, "wait", &cfg.restore_wait_ms))
         return reply(r, "400 Bad Request", "invalid numeric campaign parameter");
     int found = qget(qs, "delays", v, sizeof v);

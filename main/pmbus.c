@@ -103,7 +103,15 @@ static bool bus_open(uint32_t hz, bool use_pulls)
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = PMBUS_ADDR,
         .scl_speed_hz = hz,
-        .scl_wait_us = 10000,          // tolerate clock stretching
+        // Clock-stretch budget, PER CLOCK. 10 ms (the IDF default this file used) is not
+        // a timeout, it is a licence to block: a 4-byte VMIN write is ~40 clocks, so a
+        // controller that stretches every clock -- which is exactly what MP2888B does
+        // while the card tries to boot out of the dip -- can hold one transaction for
+        // 400 ms. Our own profile says a healthy step takes 93-94 us, so 2 ms is already
+        // ~20x the real figure and it keeps the worst case under the glitch watchdog.
+        // A bus that genuinely needs more stretching fails the bring-up probe and steps
+        // down the baud rate, which is the designed behaviour for a slow bus.
+        .scl_wait_us = 2000,
     };
     if (i2c_master_bus_add_device(s_bus, &dcfg, &s_dev) != ESP_OK) {
         bus_teardown();
@@ -206,14 +214,38 @@ bool pmbus_set_baud(unsigned long hz)
     return true;
 }
 
-// ---------------------------------------------------------------- pmbus
+// ------------------------------------------------------------- timeline guard
+// Inside a running timeline a bus that has gone down must fail that write, not be
+// brought back up: pmbus_up() re-detects pull-ups, then walks the baud ladder with a
+// probe and a teardown per rate. That is the only path reachable from a timeline step
+// that is long enough to trip the 250 ms glitch watchdog, and a long recovery there is
+// a lie anyway -- the shot is already gone, and a restarted board loses every shot the
+// campaign still had. So the timeline reports the failure and the caller recovers.
+static bool s_seq;
+void pmbus_seq_begin(void) { s_seq = true; }
+void pmbus_seq_end(void) { s_seq = false; }
+
+// The one step that may still take the long way round: after an intentional SCL hold the
+// plan has already waited seconds, so bringing the bus back here costs nothing the shot
+// was not going to lose anyway -- and without it, every step after GA_SCL_REL in a
+// hold_ms>0 plan would fail on a bus we ourselves took down.
+bool pmbus_seq_reopen(void)
+{
+    bool was = s_seq, ok;
+    s_seq = false;
+    ok = pmbus_up();
+    s_seq = was;
+    return ok;
+}
+
+// ------------------------------------------------------------------ pmbus
 // Hot path for the IRAM timeline: pmbus_up() returns immediately once the
 // bus is established (flash cache is on during the sequence; only the
 // no-cache-disabled invariant matters, and no flash op runs mid-sequence).
 IRAM_ATTR bool pmbus_w(uint8_t reg, const uint8_t *d, int n)
 {
     if (n < 0 || n > 3 || (n && !d)) return false;
-    if (!s_up && !pmbus_up()) return false;
+    if (!s_up) { if (s_seq) return false; if (!pmbus_up()) return false; }
     uint8_t b[4];
     b[0] = reg;
     for (int i = 0; i < n; i++) b[1 + i] = d[i];
@@ -229,7 +261,7 @@ IRAM_ATTR bool pmbus_w16(uint8_t reg, uint16_t v)
 IRAM_ATTR bool pmbus_r(uint8_t reg, uint8_t *d, int n)
 {
     if (!d || n <= 0) return false;
-    if (!pmbus_up()) return false;
+    if (!s_up) { if (s_seq) return false; if (!pmbus_up()) return false; }
     return i2c_master_transmit_receive(s_dev, &reg, 1, d, n, I2C_TO_MS) == ESP_OK;
 }
 

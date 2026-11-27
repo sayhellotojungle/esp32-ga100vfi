@@ -14,6 +14,10 @@ fi
 GA_BASE=${GA_BASE:-$HOME/ga100vfi}
 IMG=${IMG:?用法: BOARD=http://<设备IP> IMG=镜像 [EXPECT=sha前缀] bash ota.sh}
 EXPECT=${EXPECT:-}
+# BOARD=http://IP/ 是最自然的写法，而设备的 HTTP 路由按整串 URI 匹配：多个斜杠的
+# //api/ota 直接 404，六次重试全烧在同一个拼写上（2026-11-25 实测）。地址归一化在这里做，
+# 不在调用者的记性里做。
+BOARD=${BOARD%/}
 
 systemctl stop ga100vfi-agent 2>/dev/null || true
 pkill -9 -f 'ga100vfi ru[n]|ga100vfi_ag[ent]' 2>/dev/null || true
